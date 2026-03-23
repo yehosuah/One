@@ -193,6 +193,18 @@ def _habit_sort_score(habit: Habit) -> float:
     return score
 
 
+def _todo_today_sort_key(todo: Todo, today: date, timezone: str) -> tuple[float, float, str]:
+    return (
+        -_todo_urgency_score(todo, today, timezone),
+        -todo.created_at.timestamp(),
+        todo.title.casefold(),
+    )
+
+
+def _habit_today_sort_key(habit: Habit) -> tuple[float, str]:
+    return (-_habit_sort_score(habit), habit.title.casefold())
+
+
 def build_today_items(
     *,
     today: date,
@@ -209,24 +221,38 @@ def build_today_items(
 
     items: list[TodayItem] = []
 
-    pinned_todos = [
-        todo for todo in todos if todo.status is TodoStatus.OPEN and todo.is_pinned
-    ]
-    urgent_todos = [
-        todo
-        for todo in todos
-        if todo.status is TodoStatus.OPEN and not todo.is_pinned and todo.due_at is not None and _as_local(todo.due_at, timezone).date() <= today
-    ]
-    remaining_todos = [
-        todo
-        for todo in todos
-        if todo.status is TodoStatus.OPEN and not todo.is_pinned and todo not in urgent_todos
-    ]
-    completed_todos = [
-        todo
-        for todo in todos
-        if todo.status is TodoStatus.COMPLETED and todo_action_date(todo, timezone) == today
-    ]
+    pinned_todos = sorted(
+        [todo for todo in todos if todo.status is TodoStatus.OPEN and todo.is_pinned],
+        key=lambda todo: _todo_today_sort_key(todo, today, timezone),
+    )
+    urgent_todos = sorted(
+        [
+            todo
+            for todo in todos
+            if todo.status is TodoStatus.OPEN and not todo.is_pinned and todo.due_at is not None and _as_local(todo.due_at, timezone).date() <= today
+        ],
+        key=lambda todo: _todo_today_sort_key(todo, today, timezone),
+    )
+    remaining_todos = sorted(
+        [
+            todo
+            for todo in todos
+            if todo.status is TodoStatus.OPEN and not todo.is_pinned and todo not in urgent_todos
+        ],
+        key=lambda todo: _todo_today_sort_key(todo, today, timezone),
+    )
+    completed_todos = sorted(
+        [
+            todo
+            for todo in todos
+            if todo.status is TodoStatus.COMPLETED and todo_action_date(todo, timezone) == today
+        ],
+        key=lambda todo: _todo_today_sort_key(todo, today, timezone),
+    )
+    scheduled_habits = sorted(
+        [habit for habit in habits if is_habit_scheduled(habit, today)],
+        key=_habit_today_sort_key,
+    )
 
     for todo in pinned_todos:
         subtitle = "Todo"
@@ -270,9 +296,7 @@ def build_today_items(
             )
         )
 
-    for habit in habits:
-        if not is_habit_scheduled(habit, today):
-            continue
+    for habit in scheduled_habits:
         log = habit_logs.get(habit.id)
         subtitle = f"Habit · {habit.recurrence_rule}"
         if habit.preferred_time is not None:
@@ -334,7 +358,7 @@ def build_today_items(
             )
         )
 
-    items.sort(key=lambda x: (x.sort_bucket, -x.sort_score, x.title.lower()))
+    items.sort(key=lambda x: (x.sort_bucket, -x.sort_score))
     return items
 
 

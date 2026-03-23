@@ -141,6 +141,37 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(items[0].item_type, ItemType.TODO)
         self.assertIn("completed", items[0].subtitle or "")
 
+    def test_same_priority_remaining_todos_show_newest_first(self) -> None:
+        target = date(2026, 3, 11)
+        older = Todo(
+            id="t-old",
+            user_id="u1",
+            category_id="c-life",
+            title="Alpha task",
+            priority=50,
+            created_at=datetime(2026, 3, 10, 9, 0),
+            updated_at=datetime(2026, 3, 10, 9, 0),
+        )
+        newer = Todo(
+            id="t-new",
+            user_id="u1",
+            category_id="c-life",
+            title="Zulu task",
+            priority=50,
+            created_at=datetime(2026, 3, 10, 10, 0),
+            updated_at=datetime(2026, 3, 10, 10, 0),
+        )
+
+        items = build_today_items(
+            today=target,
+            timezone="America/Guatemala",
+            habits=[],
+            todos=[older, newer],
+            completion_logs=[],
+        )
+
+        self.assertEqual([item.item_id for item in items], ["t-new", "t-old"])
+
     def test_todo_action_date_uses_due_date_else_created_date(self) -> None:
         todo_due = Todo(
             id="t1",
