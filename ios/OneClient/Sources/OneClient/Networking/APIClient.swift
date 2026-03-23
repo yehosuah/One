@@ -840,6 +840,20 @@ public actor MockAPIClient: APIClient {
                 verseRef: "Proverbs 16:3",
                 verseText: "Commit to the Lord whatever you do, and he will establish your plans."
             ),
+            CoachCard(
+                id: "coach-3",
+                title: "Reset Cleanly",
+                body: "Misses are not the story unless you keep carrying them. Restart at the next honest action.",
+                verseRef: "Proverbs 24:16",
+                verseText: "For a just man falleth seven times, and riseth up again."
+            ),
+            CoachCard(
+                id: "coach-4",
+                title: "Work From Calm",
+                body: "Noise creates fake urgency. Protect the next clear step and let the rest wait its turn.",
+                verseRef: "2 Timothy 1:7",
+                verseText: "For God hath not given us the spirit of fear; but of power, and of love, and of a sound mind."
+            ),
         ]
         self.reflections = []
     }

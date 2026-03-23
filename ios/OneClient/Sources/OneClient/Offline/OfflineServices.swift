@@ -53,6 +53,56 @@ struct LocalCoachingService {
                 locale: "en",
                 isActive: true
             ),
+            CoachCard(
+                id: UUID().uuidString,
+                title: "Reset without drama",
+                body: "If the day slipped, restart at the next honest step instead of negotiating with the miss.",
+                verseRef: "Proverbs 24:16",
+                verseText: "For a just man falleth seven times, and riseth up again.",
+                tags: ["reset", "resilience"],
+                locale: "en",
+                isActive: true
+            ),
+            CoachCard(
+                id: UUID().uuidString,
+                title: "Work from a quiet center",
+                body: "Pressure is a signal to simplify. Protect the next clear action and let the noise stay outside it.",
+                verseRef: "2 Timothy 1:7",
+                verseText: "For God hath not given us the spirit of fear; but of power, and of love, and of a sound mind.",
+                tags: ["stress", "clarity"],
+                locale: "en",
+                isActive: true
+            ),
+            CoachCard(
+                id: UUID().uuidString,
+                title: "Give the tired part a structure",
+                body: "Low energy does not require a lost day. Shrink the scope and keep the rhythm alive.",
+                verseRef: "Isaiah 40:31",
+                verseText: "But they that wait upon the Lord shall renew their strength.",
+                tags: ["fatigue", "recovery"],
+                locale: "en",
+                isActive: true
+            ),
+            CoachCard(
+                id: UUID().uuidString,
+                title: "Stay faithful in the small work",
+                body: "The invisible reps still count. Quiet consistency is usually what makes the visible progress possible.",
+                verseRef: "Colossians 3:23",
+                verseText: "And whatsoever ye do, do it heartily, as to the Lord, and not unto men.",
+                tags: ["faithfulness", "discipline"],
+                locale: "en",
+                isActive: true
+            ),
+            CoachCard(
+                id: UUID().uuidString,
+                title: "Ask for help and keep moving",
+                body: "When the day feels heavier than your plan, trade isolation for honesty and keep one step in motion.",
+                verseRef: "Matthew 11:28",
+                verseText: "Come unto me, all ye that labour and are heavy laden, and I will give you rest.",
+                tags: ["rest", "encouragement"],
+                locale: "en",
+                isActive: true
+            ),
         ]
     }
 
@@ -261,31 +311,47 @@ struct LocalTodayService {
                 .map { ($0.itemId, $0) }
         )
 
-        let pinnedTodos = todos
-            .filter { $0.userId == user.id && $0.status == .open && $0.isPinned }
-        let urgentTodos = todos
-            .filter { $0.userId == user.id && $0.status == .open && !$0.isPinned }
-            .filter { todo in
-                guard let dueAt = todo.dueAt else {
-                    return false
-                }
-                return OfflineDateCoding.localDateString(from: dueAt, timezoneID: user.timezone) <= targetDate
-            }
-        let remainingTodos = todos
-            .filter { $0.userId == user.id && $0.status == .open && !$0.isPinned }
-            .filter { todo in
-                !urgentTodos.contains(where: { $0.id == todo.id })
-            }
-        let completedTodos = todos
-            .filter { $0.userId == user.id && $0.status == .completed }
-            .filter { todo in
-                if let dueAt = todo.dueAt {
-                    return OfflineDateCoding.localDateString(from: dueAt, timezoneID: user.timezone) == targetDate
-                }
-                return OfflineDateCoding.localDateString(from: todo.createdAt, timezoneID: user.timezone) == targetDate
-            }
-        let scheduledHabits = habits
-            .filter { $0.userId == user.id && isHabitScheduled($0, on: targetDate) }
+        let pinnedTodos = sortedTodosForToday(
+            todos.filter { $0.userId == user.id && $0.status == .open && $0.isPinned },
+            targetDate: targetDate,
+            timezoneID: user.timezone
+        )
+        let urgentTodos = sortedTodosForToday(
+            todos
+                .filter { $0.userId == user.id && $0.status == .open && !$0.isPinned }
+                .filter { todo in
+                    guard let dueAt = todo.dueAt else {
+                        return false
+                    }
+                    return OfflineDateCoding.localDateString(from: dueAt, timezoneID: user.timezone) <= targetDate
+                },
+            targetDate: targetDate,
+            timezoneID: user.timezone
+        )
+        let remainingTodos = sortedTodosForToday(
+            todos
+                .filter { $0.userId == user.id && $0.status == .open && !$0.isPinned }
+                .filter { todo in
+                    !urgentTodos.contains(where: { $0.id == todo.id })
+                },
+            targetDate: targetDate,
+            timezoneID: user.timezone
+        )
+        let completedTodos = sortedTodosForToday(
+            todos
+                .filter { $0.userId == user.id && $0.status == .completed }
+                .filter { todo in
+                    if let dueAt = todo.dueAt {
+                        return OfflineDateCoding.localDateString(from: dueAt, timezoneID: user.timezone) == targetDate
+                    }
+                    return OfflineDateCoding.localDateString(from: todo.createdAt, timezoneID: user.timezone) == targetDate
+                },
+            targetDate: targetDate,
+            timezoneID: user.timezone
+        )
+        let scheduledHabits = sortedHabitsForToday(
+            habits.filter { $0.userId == user.id && isHabitScheduled($0, on: targetDate) }
+        )
 
         var items: [TodayItem] = []
 
@@ -387,15 +453,17 @@ struct LocalTodayService {
             )
         }
 
-        return items.sorted {
-            if $0.sortBucket != $1.sortBucket {
-                return $0.sortBucket < $1.sortBucket
+        return items.enumerated()
+            .sorted { lhs, rhs in
+                if lhs.element.sortBucket != rhs.element.sortBucket {
+                    return lhs.element.sortBucket < rhs.element.sortBucket
+                }
+                if lhs.element.sortScore != rhs.element.sortScore {
+                    return lhs.element.sortScore > rhs.element.sortScore
+                }
+                return lhs.offset < rhs.offset
             }
-            if $0.sortScore != $1.sortScore {
-                return $0.sortScore > $1.sortScore
-            }
-            return $0.title < $1.title
-        }
+            .map(\.element)
     }
 
     private func applyOverrides(to items: [TodayItem], overrides: [TodayOrderOverrideRecord]) -> [TodayItem] {
@@ -457,6 +525,20 @@ struct LocalTodayService {
         return score
     }
 
+    private func sortedTodosForToday(_ todos: [Todo], targetDate: String, timezoneID: String) -> [Todo] {
+        todos.sorted { lhs, rhs in
+            let lhsScore = todoUrgencyScore(lhs, today: targetDate, timezoneID: timezoneID)
+            let rhsScore = todoUrgencyScore(rhs, today: targetDate, timezoneID: timezoneID)
+            if lhsScore != rhsScore {
+                return lhsScore > rhsScore
+            }
+            if lhs.createdAt != rhs.createdAt {
+                return lhs.createdAt > rhs.createdAt
+            }
+            return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+        }
+    }
+
     private func habitSortScore(_ habit: Habit) -> Double {
         var score = Double(habit.priorityWeight)
         if let preferredTime = habit.preferredTime,
@@ -464,6 +546,17 @@ struct LocalTodayService {
             score += max(0, Double(1_440 - minutes) / 1_440.0)
         }
         return score
+    }
+
+    private func sortedHabitsForToday(_ habits: [Habit]) -> [Habit] {
+        habits.sorted { lhs, rhs in
+            let lhsScore = habitSortScore(lhs)
+            let rhsScore = habitSortScore(rhs)
+            if lhsScore != rhsScore {
+                return lhsScore > rhsScore
+            }
+            return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+        }
     }
 
     func isHabitScheduled(_ habit: Habit, on targetDate: String) -> Bool {

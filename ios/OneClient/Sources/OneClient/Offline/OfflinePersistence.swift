@@ -304,6 +304,10 @@ public enum LocalPersistenceFactory {
             LocalTodayOrderOverrideEntity.self,
             LocalReflectionEntity.self,
             LocalCoachCardEntity.self,
+            LocalFinanceTransactionEntity.self,
+            LocalFinanceCategoryEntity.self,
+            LocalFinanceBalanceEntity.self,
+            LocalRecurringFinanceTransactionEntity.self,
             PendingMutationEntity.self,
         ])
         let configuration: ModelConfiguration
