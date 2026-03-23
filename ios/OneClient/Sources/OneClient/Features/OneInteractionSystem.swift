@@ -78,6 +78,24 @@ extension View {
     func oneEntranceReveal(index: Int = 0) -> some View {
         self
     }
+
+    @ViewBuilder
+    func oneKeyboardDismissible() -> some View {
+        #if os(iOS)
+        self
+            .scrollDismissesKeyboard(.interactively)
+            .toolbar {
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Done") {
+                        OneKeyboard.dismiss()
+                    }
+                }
+            }
+        #else
+        self
+        #endif
+    }
 }
 
 enum OneHapticEvent: String, Hashable {
@@ -235,6 +253,15 @@ final class OneKeyboardObserver: ObservableObject {
     }
 }
 
+#if os(iOS)
+enum OneKeyboard {
+    @MainActor
+    static func dismiss() {
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+    }
+}
+#endif
+
 @MainActor
 final class OneQuickActionCenter: ObservableObject {
     @Published private(set) var quickNoteRequest = 0
@@ -303,16 +330,16 @@ struct OneSyncFeedbackPill: View {
     let palette: OneTheme.Palette
     let feedback: OneSyncFeedback
 
-    private var iconName: String {
+    private var iconKey: OneIconKey {
         switch feedback.kind {
         case .local:
-            return "icloud.and.arrow.up"
+            return .offline
         case .syncing:
-            return "arrow.triangle.2.circlepath"
+            return .sync
         case .synced:
-            return "checkmark.circle.fill"
+            return .success
         case .failed:
-            return "exclamationmark.triangle.fill"
+            return .warning
         }
     }
 
@@ -329,14 +356,15 @@ struct OneSyncFeedbackPill: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: iconName)
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(tint)
-                .frame(width: 28, height: 28)
-                .background(
-                    Circle()
-                        .fill(palette.surfaceMuted)
-                )
+            OneIconBadge(
+                key: iconKey,
+                palette: palette,
+                size: 28,
+                tint: tint,
+                background: palette.surfaceMuted,
+                border: palette.border,
+                shape: .circle
+            )
             VStack(alignment: .leading, spacing: 2) {
                 Text(feedback.title)
                     .font(OneType.label)

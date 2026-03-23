@@ -190,6 +190,10 @@ public final class TasksViewModel: ObservableObject {
             }
             await scheduleRefresher.refreshSchedules()
             OneHaptics.shared.trigger(.saveSucceeded)
+            OneSyncFeedbackCenter.shared.showSynced(
+                title: "Habit added",
+                message: "\(created.title) is ready for Today."
+            )
             errorMessage = nil
             return created
         } catch {
@@ -207,6 +211,10 @@ public final class TasksViewModel: ObservableObject {
             }
             await scheduleRefresher.refreshSchedules()
             OneHaptics.shared.trigger(.saveSucceeded)
+            OneSyncFeedbackCenter.shared.showSynced(
+                title: "Task added",
+                message: "\(created.title) was added to your queue."
+            )
             errorMessage = nil
             return created
         } catch {
@@ -226,6 +234,10 @@ public final class TasksViewModel: ObservableObject {
             }
             await scheduleRefresher.refreshSchedules()
             OneHaptics.shared.trigger(.saveSucceeded)
+            OneSyncFeedbackCenter.shared.showSynced(
+                title: "Habit saved",
+                message: "\(updated.title) stays aligned with Today."
+            )
             errorMessage = nil
             return updated
         } catch {
@@ -245,6 +257,10 @@ public final class TasksViewModel: ObservableObject {
             }
             await scheduleRefresher.refreshSchedules()
             OneHaptics.shared.trigger(.saveSucceeded)
+            OneSyncFeedbackCenter.shared.showSynced(
+                title: "Task saved",
+                message: "\(updated.title) was updated."
+            )
             errorMessage = nil
             return updated
         } catch {
@@ -491,6 +507,47 @@ public struct AnalyticsMonthWeekBucket: Sendable, Equatable, Identifiable {
     public var id: Int { week }
 }
 
+public struct AnalyticsExecutionSplitRow: Sendable, Equatable, Identifiable {
+    public let id: String
+    public let title: String
+    public let completedItems: Int
+    public let expectedItems: Int
+    public let completionRate: Double
+
+    public init(id: String, title: String, completedItems: Int, expectedItems: Int, completionRate: Double) {
+        self.id = id
+        self.title = title
+        self.completedItems = completedItems
+        self.expectedItems = expectedItems
+        self.completionRate = completionRate
+    }
+}
+
+public struct AnalyticsRecoveryRow: Sendable, Equatable, Identifiable {
+    public let id: String
+    public let label: String
+    public let completedItems: Int
+    public let expectedItems: Int
+    public let gap: Int
+    public let completionRate: Double
+
+    public init(
+        id: String,
+        label: String,
+        completedItems: Int,
+        expectedItems: Int,
+        gap: Int,
+        completionRate: Double
+    ) {
+        self.id = id
+        self.label = label
+        self.completedItems = completedItems
+        self.expectedItems = expectedItems
+        self.gap = gap
+        self.completionRate = completionRate
+    }
+}
+
 public struct NotesDayOption: Sendable, Equatable, Identifiable {
     public let dateLocal: String
     public let weekdayLabel: String
@@ -572,6 +629,8 @@ private struct AnalyticsPresentation: Sendable {
     let chartSeries: AnalyticsChartSeries
     let contributionSections: [AnalyticsContributionMonthSection]
     let monthWeekBuckets: [AnalyticsMonthWeekBucket]
+    let executionRows: [AnalyticsExecutionSplitRow]
+    let recoveryRows: [AnalyticsRecoveryRow]
 }
 
 private struct AnalyticsPeriodCacheKey: Hashable {
@@ -589,6 +648,7 @@ private struct AnalyticsPresentationCacheKey: Hashable {
 public final class AnalyticsViewModel: ObservableObject {
     @Published public var selectedPeriod: PeriodType = .weekly
     @Published public var selectedActivityFilter: AnalyticsActivityFilter = .all
+    @Published public private(set) var pendingPeriod: PeriodType?
     @Published public private(set) var summary: PeriodSummary?
     @Published public private(set) var weekly: PeriodSummary?
     @Published public private(set) var dailySummaries: [DailySummary] = []
@@ -598,8 +658,11 @@ public final class AnalyticsViewModel: ObservableObject {
     @Published public private(set) var monthWeekBuckets: [AnalyticsMonthWeekBucket] = []
     @Published public private(set) var selectedMonthWeek: Int?
     @Published public private(set) var sentimentOverview: AnalyticsSentimentOverview?
+    @Published public private(set) var executionRows: [AnalyticsExecutionSplitRow] = []
+    @Published public private(set) var recoveryRows: [AnalyticsRecoveryRow] = []
     @Published public private(set) var errorMessage: String?
     @Published public private(set) var isTransitioning = false
+    @Published public private(set) var isSwitchingPeriod = false
 
     private let repository: AnalyticsRepository
     private let reflectionsRepository: ReflectionsRepository
@@ -608,6 +671,8 @@ public final class AnalyticsViewModel: ObservableObject {
     private var currentPeriodKey: AnalyticsPeriodCacheKey?
     private var weeklyPeriodKey: AnalyticsPeriodCacheKey?
     private var rawDailyNotes: [ReflectionNote] = []
+    private var activePeriodLoadTask: Task<(AnalyticsRawPeriodData, [ReflectionNote]), Error>?
+    private var activePeriodLoadID = UUID()
 
     public init(
         repository: AnalyticsRepository,
@@ -682,13 +747,21 @@ public final class AnalyticsViewModel: ObservableObject {
 
     public func loadPeriod(anchorDate: String, periodType: PeriodType, weekStart: Int = 0) async {
         let key = AnalyticsPeriodCacheKey(anchorDate: anchorDate, periodType: periodType, weekStart: weekStart)
+        let cachedRawData = rawPeriodCache[key]
+        let loadID = UUID()
+
+        activePeriodLoadID = loadID
+        activePeriodLoadTask?.cancel()
+        pendingPeriod = periodType
+        isSwitchingPeriod = true
         isTransitioning = true
-        defer { isTransitioning = false }
-        do {
-            selectedPeriod = periodType
+
+        let repository = self.repository
+        let reflectionsRepository = self.reflectionsRepository
+        let task = Task<(AnalyticsRawPeriodData, [ReflectionNote]), Error> {
             let rawData: AnalyticsRawPeriodData
-            if let cached = rawPeriodCache[key] {
-                rawData = cached
+            if let cachedRawData {
+                rawData = cachedRawData
             } else {
                 let bounds = AnalyticsDateRange.bounds(anchorDate: anchorDate, periodType: periodType, weekStart: weekStart)
                 async let loadedSummary = repository.loadPeriod(anchorDate: anchorDate, periodType: periodType)
@@ -697,22 +770,54 @@ public final class AnalyticsViewModel: ObservableObject {
                     summary: loadedSummary,
                     dailySummaries: loadedDaily
                 )
-                rawPeriodCache[key] = rawData
             }
 
-            rawDailyNotes = try await reflectionsRepository.list(periodType: .daily)
+            let notes = try await reflectionsRepository.list(periodType: .daily)
+            try Task.checkCancellation()
+            return (rawData, notes)
+        }
+
+        activePeriodLoadTask = task
+
+        do {
+            let (rawData, notes) = try await task.value
+            guard activePeriodLoadID == loadID else {
+                return
+            }
+
+            if cachedRawData == nil {
+                rawPeriodCache[key] = rawData
+            }
+            rawDailyNotes = notes
             presentationCache = presentationCache.filter { $0.key.periodKey != key }
             currentPeriodKey = key
             let currentPresentation = presentation(for: rawData, key: key)
-            applyPresentation(currentPresentation, key: key)
+            applyPresentation(currentPresentation, key: key, committedPeriod: periodType)
             if periodType == .weekly {
                 weeklyPeriodKey = key
                 weeklyDailySummaries = currentPresentation.dailySummaries
                 weekly = currentPresentation.summary
             }
+
+            pendingPeriod = nil
+            isSwitchingPeriod = false
+            isTransitioning = false
             OneHaptics.shared.trigger(.periodSwitched)
             errorMessage = nil
+        } catch is CancellationError {
+            guard activePeriodLoadID == loadID else {
+                return
+            }
+            pendingPeriod = nil
+            isSwitchingPeriod = false
+            isTransitioning = false
         } catch {
+            guard activePeriodLoadID == loadID else {
+                return
+            }
+            pendingPeriod = nil
+            isSwitchingPeriod = false
+            isTransitioning = false
             OneHaptics.shared.trigger(.saveFailed)
             errorMessage = userFacingError(error)
         }
@@ -746,16 +851,27 @@ public final class AnalyticsViewModel: ObservableObject {
             dailySummaries: filtered,
             chartSeries: buildChartSeries(from: filtered, periodType: rawData.summary.periodType),
             contributionSections: buildContributionSections(from: filtered),
-            monthWeekBuckets: buildMonthWeekBuckets(from: filtered)
+            monthWeekBuckets: buildMonthWeekBuckets(from: filtered),
+            executionRows: buildExecutionRows(from: rawData.dailySummaries),
+            recoveryRows: buildRecoveryRows(from: filtered, periodType: rawData.summary.periodType)
         )
         presentationCache[cacheKey] = presentation
         return presentation
     }
 
-    private func applyPresentation(_ presentation: AnalyticsPresentation, key: AnalyticsPeriodCacheKey) {
+    private func applyPresentation(
+        _ presentation: AnalyticsPresentation,
+        key: AnalyticsPeriodCacheKey,
+        committedPeriod: PeriodType? = nil
+    ) {
         withAnimation(OneMotion.animation(.stateChange)) {
+            if let committedPeriod {
+                selectedPeriod = committedPeriod
+            }
             summary = presentation.summary
             chartSeries = presentation.chartSeries
+            executionRows = presentation.executionRows
+            recoveryRows = presentation.recoveryRows
 
             switch key.periodType {
             case .monthly:
@@ -881,6 +997,109 @@ public final class AnalyticsViewModel: ObservableObject {
         case .daily:
             return AnalyticsChartSeries()
         }
+    }
+
+    private func buildExecutionRows(from summaries: [DailySummary]) -> [AnalyticsExecutionSplitRow] {
+        let habitCompleted = summaries.reduce(0) { $0 + $1.habitCompleted }
+        let habitExpected = summaries.reduce(0) { $0 + $1.habitExpected }
+        let todoCompleted = summaries.reduce(0) { $0 + $1.todoCompleted }
+        let todoExpected = summaries.reduce(0) { $0 + $1.todoExpected }
+
+        return [
+            AnalyticsExecutionSplitRow(
+                id: "habits",
+                title: "Habits",
+                completedItems: habitCompleted,
+                expectedItems: habitExpected,
+                completionRate: habitExpected == 0 ? 0 : Double(habitCompleted) / Double(habitExpected)
+            ),
+            AnalyticsExecutionSplitRow(
+                id: "tasks",
+                title: "Tasks",
+                completedItems: todoCompleted,
+                expectedItems: todoExpected,
+                completionRate: todoExpected == 0 ? 0 : Double(todoCompleted) / Double(todoExpected)
+            ),
+        ]
+    }
+
+    private func buildRecoveryRows(from summaries: [DailySummary], periodType: PeriodType) -> [AnalyticsRecoveryRow] {
+        let rows: [AnalyticsRecoveryRow]
+
+        switch periodType {
+        case .daily:
+            rows = summaries.prefix(1).map {
+                makeRecoveryRow(
+                    id: $0.dateLocal,
+                    label: OneDate.shortMonthDay(from: $0.dateLocal),
+                    completedItems: $0.completedItems,
+                    expectedItems: $0.expectedItems
+                )
+            }
+        case .weekly:
+            rows = summaries.map {
+                makeRecoveryRow(
+                    id: $0.dateLocal,
+                    label: OneDate.shortWeekday(from: $0.dateLocal),
+                    completedItems: $0.completedItems,
+                    expectedItems: $0.expectedItems
+                )
+            }
+        case .monthly:
+            let grouped = Dictionary(grouping: summaries) { monthSegment(for: $0.dateLocal) }
+            rows = grouped.keys.sorted().map { week in
+                let entries = grouped[week] ?? []
+                return makeRecoveryRow(
+                    id: "week-\(week)",
+                    label: "Week \(week)",
+                    completedItems: entries.reduce(0) { $0 + $1.completedItems },
+                    expectedItems: entries.reduce(0) { $0 + $1.expectedItems }
+                )
+            }
+        case .yearly:
+            let grouped = Dictionary(grouping: summaries) { OneDate.monthBucket(from: $0.dateLocal) }
+            rows = grouped.keys.sorted().map { month in
+                let entries = grouped[month] ?? []
+                return makeRecoveryRow(
+                    id: "month-\(month)",
+                    label: OneDate.shortMonth(for: month),
+                    completedItems: entries.reduce(0) { $0 + $1.completedItems },
+                    expectedItems: entries.reduce(0) { $0 + $1.expectedItems }
+                )
+            }
+        }
+
+        return rows
+            .filter { $0.expectedItems > 0 || $0.completedItems > 0 }
+            .sorted { lhs, rhs in
+                if lhs.gap != rhs.gap {
+                    return lhs.gap > rhs.gap
+                }
+                if lhs.completionRate != rhs.completionRate {
+                    return lhs.completionRate < rhs.completionRate
+                }
+                return lhs.label < rhs.label
+            }
+            .prefix(4)
+            .map { $0 }
+    }
+
+    private func makeRecoveryRow(
+        id: String,
+        label: String,
+        completedItems: Int,
+        expectedItems: Int
+    ) -> AnalyticsRecoveryRow {
+        let gap = max(expectedItems - completedItems, 0)
+        let completionRate = expectedItems == 0 ? 0 : Double(completedItems) / Double(expectedItems)
+        return AnalyticsRecoveryRow(
+            id: id,
+            label: label,
+            completedItems: completedItems,
+            expectedItems: expectedItems,
+            gap: gap,
+            completionRate: completionRate
+        )
     }
 
     private func buildMonthWeekBuckets(from summaries: [DailySummary]) -> [AnalyticsMonthWeekBucket] {
@@ -1157,6 +1376,7 @@ public final class ReflectionsViewModel: ObservableObject {
             return false
         }
     }
+
 }
 
 @MainActor
@@ -1292,6 +1512,49 @@ public final class NotesViewModel: ObservableObject {
             refreshDerivedState()
         }
         OneHaptics.shared.trigger(.selectionChanged)
+    }
+
+    @discardableResult
+    public func createNote(
+        content: String,
+        sentiment: ReflectionSentiment,
+        for dateLocal: String? = nil
+    ) async -> ReflectionNote? {
+        let targetDate = dateLocal ?? selectedDateLocal
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+
+        do {
+            let note = try await repository.upsert(
+                input: ReflectionWriteInput(
+                    periodType: .daily,
+                    periodStart: targetDate,
+                    periodEnd: targetDate,
+                    content: trimmed,
+                    sentiment: sentiment
+                )
+            )
+            withAnimation(OneMotion.animation(.stateChange)) {
+                anchorDate = targetDate
+                selectedDateLocal = targetDate
+                selectedYearMonth = OneDate.monthBucket(from: targetDate)
+                allNotes.insert(note, at: 0)
+                refreshDerivedState()
+            }
+            OneHaptics.shared.trigger(.saveSucceeded)
+            OneSyncFeedbackCenter.shared.showSynced(
+                title: "Note saved",
+                message: "Reflection added for \(OneDate.shortMonthDay(from: targetDate))."
+            )
+            errorMessage = nil
+            return note
+        } catch {
+            OneHaptics.shared.trigger(.saveFailed)
+            errorMessage = userFacingError(error)
+            return nil
+        }
     }
 
     public func delete(id: String) async -> Bool {
@@ -1556,7 +1819,8 @@ public final class ProfileViewModel: ObservableObject, NotificationScheduleRefre
         }
     }
 
-    public func saveProfile(displayName: String) async {
+    @discardableResult
+    public func saveProfile(displayName: String) async -> Bool {
         do {
             let updatedUser = try await repository.updateProfile(
                 UserProfileUpdateInput(
@@ -1568,14 +1832,21 @@ public final class ProfileViewModel: ObservableObject, NotificationScheduleRefre
                 user = updatedUser
             }
             OneHaptics.shared.trigger(.saveSucceeded)
+            OneSyncFeedbackCenter.shared.showSynced(
+                title: "Name saved",
+                message: "Your profile is updated on this device."
+            )
             errorMessage = nil
+            return true
         } catch {
             OneHaptics.shared.trigger(.saveFailed)
             errorMessage = userFacingError(error)
+            return false
         }
     }
 
-    public func savePreferences(input: UserPreferencesUpdateInput) async {
+    @discardableResult
+    public func savePreferences(input: UserPreferencesUpdateInput) async -> Bool {
         do {
             let updated = try await repository.updatePreferences(input)
             withAnimation(OneMotion.animation(.stateChange)) {
@@ -1583,10 +1854,16 @@ public final class ProfileViewModel: ObservableObject, NotificationScheduleRefre
             }
             notificationStatus = await applier.apply(preferences: updated)
             OneHaptics.shared.trigger(.saveSucceeded)
+            OneSyncFeedbackCenter.shared.showSynced(
+                title: "Preferences saved",
+                message: "Your latest settings are stored on this device."
+            )
             errorMessage = nil
+            return true
         } catch {
             OneHaptics.shared.trigger(.saveFailed)
             errorMessage = userFacingError(error)
+            return false
         }
     }
 }

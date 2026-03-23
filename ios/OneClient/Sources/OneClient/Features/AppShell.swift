@@ -13,6 +13,7 @@ public final class OneAppContainer: ObservableObject {
     public let authViewModel: AuthViewModel
     public let tasksViewModel: TasksViewModel
     public let todayViewModel: TodayViewModel
+    public let financeViewModel: FinanceViewModel
     public let analyticsViewModel: AnalyticsViewModel
     public let profileViewModel: ProfileViewModel
     public let coachViewModel: CoachViewModel
@@ -27,6 +28,7 @@ public final class OneAppContainer: ObservableObject {
         authRepository: AuthRepository,
         tasksRepository: TasksRepository,
         todayRepository: TodayRepository,
+        financeRepository: FinanceRepository = NoopFinanceRepository(),
         analyticsRepository: AnalyticsRepository,
         reflectionsRepository: ReflectionsRepository,
         profileRepository: ProfileRepository,
@@ -42,6 +44,7 @@ public final class OneAppContainer: ObservableObject {
         self.authViewModel = AuthViewModel(repository: authRepository)
         self.tasksViewModel = TasksViewModel(repository: tasksRepository, scheduleRefresher: profileViewModel)
         self.todayViewModel = TodayViewModel(repository: todayRepository)
+        self.financeViewModel = FinanceViewModel(repository: financeRepository)
         self.analyticsViewModel = AnalyticsViewModel(
             repository: analyticsRepository,
             reflectionsRepository: reflectionsRepository
@@ -65,6 +68,7 @@ public final class OneAppContainer: ObservableObject {
 
         let apiClient: APIClient
         let syncQueue: SyncQueue
+        let financeRepository: FinanceRepository
         var fatalStartupMessage: String?
 
         #if canImport(SwiftData)
@@ -72,6 +76,10 @@ public final class OneAppContainer: ObservableObject {
             let stack = try LocalPersistenceFactory.makeStored(sessionStore: sessionStore)
             apiClient = stack.apiClient
             syncQueue = stack.syncQueue
+            financeRepository = LocalFinanceRepository(
+                container: stack.container,
+                sessionStore: sessionStore
+            )
         } catch {
             fatalStartupMessage = "Local data store is unavailable. Restart the app and try again."
             apiClient = LocalModeUnavailableAPIClient(
@@ -79,6 +87,7 @@ public final class OneAppContainer: ObservableObject {
                 message: fatalStartupMessage ?? "Local data store is unavailable."
             )
             syncQueue = InMemorySyncQueue()
+            financeRepository = NoopFinanceRepository()
         }
         #else
         fatalStartupMessage = "Local data store is unavailable. Restart the app and try again."
@@ -87,6 +96,7 @@ public final class OneAppContainer: ObservableObject {
             message: fatalStartupMessage ?? "Local data store is unavailable."
         )
         syncQueue = InMemorySyncQueue()
+        financeRepository = NoopFinanceRepository()
         #endif
 
         let notificationService: LocalNotificationService
@@ -105,6 +115,7 @@ public final class OneAppContainer: ObservableObject {
             authRepository: DefaultAuthRepository(apiClient: apiClient),
             tasksRepository: DefaultTasksRepository(apiClient: apiClient, syncQueue: syncQueue),
             todayRepository: DefaultTodayRepository(apiClient: apiClient, syncQueue: syncQueue),
+            financeRepository: financeRepository,
             analyticsRepository: DefaultAnalyticsRepository(apiClient: apiClient),
             reflectionsRepository: DefaultReflectionsRepository(apiClient: apiClient),
             profileRepository: DefaultProfileRepository(apiClient: apiClient),
@@ -124,6 +135,7 @@ public final class OneAppContainer: ObservableObject {
 
     public func refreshAll(anchorDate: String) async {
         await profileViewModel.load()
+        await refreshFinanceContext()
         await tasksViewModel.loadCategories()
         await tasksViewModel.loadTasks()
         await todayViewModel.load(date: anchorDate)
@@ -152,6 +164,11 @@ public final class OneAppContainer: ObservableObject {
         }
     }
 
+    public func refreshFinanceContext() async {
+        let weekStart = profileViewModel.preferences?.weekStart ?? 0
+        await financeViewModel.refreshAll(weekStart: weekStart)
+    }
+
     public func refreshDailyReflections() async {
         await reflectionsViewModel.load(periodType: .daily)
     }
@@ -160,6 +177,7 @@ public final class OneAppContainer: ObservableObject {
         observe(authViewModel)
         observe(tasksViewModel)
         observe(todayViewModel)
+        observe(financeViewModel)
         observe(analyticsViewModel)
         observe(profileViewModel)
         observe(coachViewModel)
@@ -313,7 +331,6 @@ private actor LocalModeUnavailableAPIClient: APIClient {
 
 public struct OneAppShell: View {
     @StateObject private var container: OneAppContainer
-    @AppStorage("one.onboarding.completed") private var onboardingCompleted = false
     @State private var selectedTab: Tab = .today
     @State private var activeSheet: SheetRoute?
     @State private var didBootstrap = false
@@ -333,11 +350,6 @@ public struct OneAppShell: View {
                 BlockingStartupView(message: fatalStartupMessage)
             } else if isBootstrapping {
                 SplashView()
-            } else if !onboardingCompleted {
-                OnboardingFlowView {
-                    onboardingCompleted = true
-                    selectedTab = .today
-                }
             } else if container.authViewModel.user == nil {
                 LocalProfileSetupView(viewModel: container.authViewModel)
             } else {
@@ -389,7 +401,13 @@ public struct OneAppShell: View {
                     activeSheet = nil
                 }
             case .coach:
-                CoachSheetView(viewModel: container.coachViewModel) {
+                CoachSheetView(
+                    viewModel: container.coachViewModel,
+                    todayViewModel: container.todayViewModel,
+                    analyticsViewModel: container.analyticsViewModel,
+                    reflectionsViewModel: container.reflectionsViewModel,
+                    currentDateLocal: currentAnchorDate
+                ) {
                     activeSheet = nil
                 }
             case .habitCategory(let categoryId):
@@ -402,6 +420,20 @@ public struct OneAppShell: View {
                     },
                     onSave: {
                         await container.refreshTasksContext(anchorDate: currentAnchorDate)
+                    }
+                )
+            case .addNote(let anchorDate):
+                NoteComposerSheetView(
+                    viewModel: container.notesViewModel,
+                    anchorDate: anchorDate,
+                    onDismiss: {
+                        activeSheet = nil
+                    },
+                    onRefreshAnalytics: {
+                        await container.refreshAnalytics(anchorDate: currentAnchorDate)
+                    },
+                    onRefreshReflections: {
+                        await container.refreshDailyReflections()
                     }
                 )
             case .notes(let anchorDate, let periodType):
@@ -447,15 +479,16 @@ public struct OneAppShell: View {
     }
 
     enum Tab: Hashable {
-        case home
         case today
-        case analytics
-        case profile
+        case review
+        case finance
+        case settings
     }
 
     enum SheetRoute: Identifiable {
         case addHabit
         case addTodo
+        case addNote(anchorDate: String)
         case notifications
         case coach
         case habitCategory(categoryId: String)
@@ -467,6 +500,8 @@ public struct OneAppShell: View {
                 return "addHabit"
             case .addTodo:
                 return "addTodo"
+            case .addNote(let anchorDate):
+                return "addNote-\(anchorDate)"
             case .notifications:
                 return "notifications"
             case .coach:
@@ -481,6 +516,42 @@ public struct OneAppShell: View {
 }
 
 private struct MainTabsView: View {
+    private enum MainTabSlot: Hashable {
+        case review
+        case today
+        case quickAdd
+        case finance
+        case settings
+
+        init(tab: OneAppShell.Tab) {
+            switch tab {
+            case .review:
+                self = .review
+            case .today:
+                self = .today
+            case .finance:
+                self = .finance
+            case .settings:
+                self = .settings
+            }
+        }
+
+        var appTab: OneAppShell.Tab? {
+            switch self {
+            case .review:
+                return .review
+            case .today:
+                return .today
+            case .finance:
+                return .finance
+            case .settings:
+                return .settings
+            case .quickAdd:
+                return nil
+            }
+        }
+    }
+
     @Binding var selectedTab: OneAppShell.Tab
     @Binding var activeSheet: OneAppShell.SheetRoute?
     @ObservedObject var container: OneAppContainer
@@ -488,6 +559,12 @@ private struct MainTabsView: View {
     let onRefreshTasksContext: () async -> Void
     let onRefreshAnalytics: () async -> Void
     let onRefreshReflections: () async -> Void
+
+    @State private var selectedSlot: MainTabSlot = .today
+    @State private var previousRealSlot: MainTabSlot = .today
+    @State private var isQuickAddExpanded = false
+    @State private var isResettingSlotSelection = false
+    @State private var financeQuickAddRequest: OneAddAction?
     @Environment(\.colorScheme) private var colorScheme
 
     private var palette: OneTheme.Palette {
@@ -498,80 +575,365 @@ private struct MainTabsView: View {
         OneDate.isoDate()
     }
 
+    private var quickAddContext: OneAddContext {
+        OneAddContext(tab: selectedTab)
+    }
+
     var body: some View {
-        GeometryReader { proxy in
-            ZStack(alignment: .bottom) {
-                TabView(selection: $selectedTab) {
-                    HomeTabView(
-                        user: container.profileViewModel.user,
-                        tasksViewModel: container.tasksViewModel,
-                        todayViewModel: container.todayViewModel,
-                        analyticsViewModel: container.analyticsViewModel,
-                        coachViewModel: container.coachViewModel,
-                        currentDateLocal: currentDateLocal,
-                        onFocusToday: { onSelectTab(.today) },
-                        onOpenSheet: { activeSheet = $0 }
+        TabView(selection: $selectedSlot) {
+            ReviewTabView(
+                analyticsViewModel: container.analyticsViewModel,
+                notesViewModel: container.notesViewModel,
+                coachViewModel: container.coachViewModel,
+                currentDateLocal: currentDateLocal,
+                weekStart: container.profileViewModel.preferences?.weekStart ?? 0,
+                onSelectPeriod: { periodType in
+                    await container.analyticsViewModel.loadPeriod(
+                        anchorDate: currentDateLocal,
+                        periodType: periodType,
+                        weekStart: container.profileViewModel.preferences?.weekStart ?? 0
                     )
-                    .tabItem { Label("Home", systemImage: "house") }
-                    .tag(OneAppShell.Tab.home)
-
-                    TodayTabView(
-                        todayViewModel: container.todayViewModel,
-                        tasksViewModel: container.tasksViewModel,
-                        currentDateLocal: currentDateLocal,
-                        onOpenSheet: { activeSheet = $0 },
-                        onRefreshTasksContext: onRefreshTasksContext,
-                        onRefreshAnalytics: onRefreshAnalytics
-                    )
-                    .tabItem { Label("Today", systemImage: "checklist") }
-                    .tag(OneAppShell.Tab.today)
-
-                    AnalyticsTabView(
-                        viewModel: container.analyticsViewModel,
-                        currentDateLocal: currentDateLocal,
-                        onSelectPeriod: { periodType in
-                            await container.analyticsViewModel.loadPeriod(
-                                anchorDate: currentDateLocal,
-                                periodType: periodType,
-                                weekStart: container.profileViewModel.preferences?.weekStart ?? 0
-                            )
-                        },
-                        onOpenNotes: { dateLocal in
-                            activeSheet = .notes(anchorDate: dateLocal, periodType: .daily)
-                        }
-                    )
-                    .tabItem { Label("Analytics", systemImage: "chart.bar.xaxis") }
-                    .tag(OneAppShell.Tab.analytics)
-
-                    ProfileTabView(
-                        authViewModel: container.authViewModel,
-                        profileViewModel: container.profileViewModel,
-                        coachViewModel: container.coachViewModel,
-                        onOpenSheet: { activeSheet = $0 }
-                    )
-                    .tabItem { Label("Settings", systemImage: "gearshape") }
-                    .tag(OneAppShell.Tab.profile)
+                },
+                onOpenSheet: { activeSheet = $0 },
+                onOpenCoach: {
+                    activeSheet = .coach
+                },
+                onRefreshAnalytics: onRefreshAnalytics,
+                onRefreshReflections: onRefreshReflections
+            )
+            .tabItem {
+                Label {
+                    Text("Review")
+                } icon: {
+                    OneIconImageFactory.tabBarImage(for: .review)
                 }
-
-                VStack(alignment: .trailing, spacing: OneDockLayout.overlayStackSpacing) {
-                    if let feedback = container.syncFeedbackCenter.feedback {
-                        OneSyncFeedbackPill(palette: palette, feedback: feedback)
-                            .frame(maxWidth: 320)
-                            .transition(.move(edge: .bottom).combined(with: .opacity))
-                    }
-                }
-                .padding(.horizontal, OneDockLayout.horizontalInset)
-                .padding(
-                    .bottom,
-                    OneDockLayout.overlayBottomInset(
-                        safeAreaBottom: proxy.safeAreaInsets.bottom,
-                        isExpanded: false
-                    )
-                )
             }
+            .tag(MainTabSlot.review)
+
+            TodayTabView(
+                todayViewModel: container.todayViewModel,
+                tasksViewModel: container.tasksViewModel,
+                currentDateLocal: currentDateLocal,
+                onOpenSheet: { activeSheet = $0 },
+                onOpenReview: openReview(for:),
+                onRefreshTasksContext: onRefreshTasksContext,
+                onRefreshAnalytics: onRefreshAnalytics
+            )
+            .tabItem {
+                Label {
+                    Text("Today")
+                } icon: {
+                    OneIconImageFactory.tabBarImage(for: .today)
+                }
+            }
+            .tag(MainTabSlot.today)
+
+            QuickAddTabPlaceholderView()
+                .tabItem {
+                    Label(
+                        isQuickAddExpanded ? "Close" : "Add",
+                        systemImage: isQuickAddExpanded ? "xmark.circle.fill" : "plus.circle.fill"
+                    )
+                }
+                .tag(MainTabSlot.quickAdd)
+
+            FinanceTabView(
+                viewModel: container.financeViewModel,
+                weekStart: container.profileViewModel.preferences?.weekStart ?? 0,
+                quickAddRequest: $financeQuickAddRequest
+            )
+            .tabItem {
+                Label {
+                    Text("Finance")
+                } icon: {
+                    OneIconImageFactory.tabBarImage(for: .finance)
+                }
+            }
+            .tag(MainTabSlot.finance)
+
+            ProfileTabView(
+                authViewModel: container.authViewModel,
+                profileViewModel: container.profileViewModel,
+                coachViewModel: container.coachViewModel,
+                onOpenSheet: { activeSheet = $0 }
+            )
+            .tabItem {
+                Label {
+                    Text("Settings")
+                } icon: {
+                    OneIconImageFactory.tabBarImage(for: .settings)
+                }
+            }
+            .tag(MainTabSlot.settings)
         }
         .tint(palette.accent)
-        .animation(OneMotion.animation(.stateChange), value: container.syncFeedbackCenter.feedback?.id)
+        .onAppear {
+            let initialSlot = MainTabSlot(tab: selectedTab)
+            selectedSlot = initialSlot
+            previousRealSlot = initialSlot
+        }
+        .onChange(of: selectedTab) { _, newValue in
+            let nextSlot = MainTabSlot(tab: newValue)
+            previousRealSlot = nextSlot
+            guard selectedSlot != nextSlot else {
+                return
+            }
+            isResettingSlotSelection = true
+            selectedSlot = nextSlot
+        }
+        .onChange(of: selectedSlot) { _, newValue in
+            handleSlotChange(newValue)
+        }
+        .onChange(of: activeSheet?.id) { _, newValue in
+            guard newValue != nil else {
+                return
+            }
+            dismissQuickAdd()
+        }
+        .overlay {
+            QuickAddTrayOverlay(
+                palette: palette,
+                context: quickAddContext,
+                isPresented: isQuickAddExpanded,
+                feedbackIsVisible: container.syncFeedbackCenter.feedback != nil,
+                onDismiss: dismissQuickAdd,
+                onSelect: handleQuickAddAction(_:)
+            )
+        }
+        .safeAreaInset(edge: .bottom) {
+            if let feedback = container.syncFeedbackCenter.feedback {
+                OneSyncFeedbackPill(palette: palette, feedback: feedback)
+                    .padding(.horizontal, OneSpacing.md)
+                    .padding(.vertical, OneSpacing.xs)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+    }
+
+    private func openReview(for dateLocal: String) {
+        guard selectedTab != .review else {
+            Task {
+                await container.notesViewModel.load(
+                    anchorDate: dateLocal,
+                    periodType: .daily,
+                    weekStart: container.profileViewModel.preferences?.weekStart ?? 0,
+                    forceReload: false
+                )
+            }
+            return
+        }
+        OneHaptics.shared.trigger(.selectionChanged)
+        onSelectTab(.review)
+        Task {
+            await container.notesViewModel.load(
+                anchorDate: dateLocal,
+                periodType: .daily,
+                weekStart: container.profileViewModel.preferences?.weekStart ?? 0,
+                forceReload: false
+            )
+        }
+    }
+
+    private func handleSlotChange(_ slot: MainTabSlot) {
+        if isResettingSlotSelection {
+            isResettingSlotSelection = false
+            return
+        }
+
+        switch slot {
+        case .quickAdd:
+            toggleQuickAdd()
+            isResettingSlotSelection = true
+            selectedSlot = previousRealSlot
+        case .today, .review, .finance, .settings:
+            dismissQuickAdd()
+            previousRealSlot = slot
+            if let appTab = slot.appTab, selectedTab != appTab {
+                onSelectTab(appTab)
+            }
+        }
+    }
+
+    private func dismissQuickAdd() {
+        guard isQuickAddExpanded else {
+            return
+        }
+        withAnimation(OneMotion.animation(.dismiss)) {
+            isQuickAddExpanded = false
+        }
+    }
+
+    private func toggleQuickAdd() {
+        OneHaptics.shared.trigger(isQuickAddExpanded ? .selectionChanged : .sheetPresented)
+        withAnimation(OneMotion.animation(isQuickAddExpanded ? .dismiss : .expand)) {
+            isQuickAddExpanded.toggle()
+        }
+    }
+
+    private func handleQuickAddAction(_ action: OneAddAction) {
+        dismissQuickAdd()
+        OneHaptics.shared.trigger(.selectionChanged)
+
+        switch action {
+        case .habit:
+            activeSheet = .addHabit
+        case .task:
+            activeSheet = .addTodo
+        case .note:
+            let anchorDate = selectedTab == .review ? container.notesViewModel.selectedDateLocal : currentDateLocal
+            activeSheet = .addNote(anchorDate: anchorDate)
+        case .income, .expense, .transfer:
+            financeQuickAddRequest = action
+        }
+    }
+}
+
+private struct QuickAddTabPlaceholderView: View {
+    var body: some View {
+        Color.clear
+            .accessibilityHidden(true)
+    }
+}
+
+private struct QuickAddTrayOverlay: View {
+    let palette: OneTheme.Palette
+    let context: OneAddContext
+    let isPresented: Bool
+    let feedbackIsVisible: Bool
+    let onDismiss: () -> Void
+    let onSelect: (OneAddAction) -> Void
+
+    var body: some View {
+        GeometryReader { proxy in
+            if isPresented {
+                ZStack(alignment: .bottom) {
+                    Color.black.opacity(palette.isDark ? 0.22 : 0.08)
+                        .ignoresSafeArea()
+                        .padding(.bottom, proxy.safeAreaInsets.bottom + 74)
+                        .contentShape(Rectangle())
+                        .onTapGesture(perform: onDismiss)
+
+                    QuickAddTray(
+                        palette: palette,
+                        context: context,
+                        onSelect: onSelect
+                    )
+                    .padding(.horizontal, OneSpacing.lg)
+                    .padding(.bottom, proxy.safeAreaInsets.bottom + 62 + (feedbackIsVisible ? 42 : 0))
+                }
+                .transition(.opacity)
+            }
+        }
+        .allowsHitTesting(isPresented)
+    }
+}
+
+private struct QuickAddTray: View {
+    let palette: OneTheme.Palette
+    let context: OneAddContext
+    let onSelect: (OneAddAction) -> Void
+
+    private var title: String {
+        switch context {
+        case .app:
+            return "Add to your system"
+        case .finance:
+            return "Add to finance"
+        }
+    }
+
+    private var subtitle: String {
+        switch context {
+        case .app:
+            return "Capture the next task, habit, or note without leaving the tab."
+        case .finance:
+            return "Log income, expenses, or transfers from the current finance view."
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: OneSpacing.sm) {
+            Text(title)
+                .font(OneType.sectionTitle)
+                .foregroundStyle(palette.text)
+            Text(subtitle)
+                .font(OneType.secondary)
+                .foregroundStyle(palette.subtext)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(spacing: 8) {
+                ForEach(context.actions) { action in
+                    QuickAddActionRow(
+                        palette: palette,
+                        action: action
+                    ) {
+                        onSelect(action)
+                    }
+                }
+            }
+        }
+        .padding(OneSpacing.md)
+        .frame(maxWidth: 320, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: OneTheme.radiusLarge, style: .continuous)
+                .fill(palette.glass)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: OneTheme.radiusLarge, style: .continuous)
+                .stroke(palette.glassStroke, lineWidth: 1)
+        )
+        .shadow(color: palette.shadowColor.opacity(0.18), radius: 16, x: 0, y: 10)
+    }
+}
+
+private struct QuickAddActionRow: View {
+    let palette: OneTheme.Palette
+    let action: OneAddAction
+    let onSelect: () -> Void
+
+    var body: some View {
+        Button(action: onSelect) {
+            HStack(spacing: 12) {
+                Circle()
+                    .fill(palette.accentSoft)
+                    .frame(width: 38, height: 38)
+                    .overlay(
+                        OneIcon(
+                            key: action.iconKey,
+                            palette: palette,
+                            size: 18,
+                            tint: palette.accent
+                        )
+                    )
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(action.title)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(palette.text)
+                    Text(action.subtitle)
+                        .font(OneType.caption)
+                        .foregroundStyle(palette.subtext)
+                }
+
+                Spacer()
+
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(palette.subtext)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: OneTheme.radiusMedium, style: .continuous)
+                    .fill(palette.surface)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: OneTheme.radiusMedium, style: .continuous)
+                    .stroke(palette.border, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .onePressable(scale: 0.98, opacity: 0.94)
     }
 }
 
@@ -628,101 +990,6 @@ private struct BlockingStartupView: View {
     }
 }
 
-private struct OnboardingFlowView: View {
-    let onComplete: () -> Void
-    @State private var page = 0
-    @Environment(\.colorScheme) private var colorScheme
-
-    private struct PageContent {
-        let symbol: String
-        let title: String
-        let body: String
-        let detail: String
-    }
-
-    private let pages: [PageContent] = [
-        PageContent(
-            symbol: "checklist",
-            title: "One keeps your day clear.",
-            body: "Track habits, tasks, progress, and notes in one calm daily system.",
-            detail: "Today is for doing. Home and Analytics help you review without getting in the way."
-        ),
-        PageContent(
-            symbol: "iphone",
-            title: "Your profile can stay on this iPhone.",
-            body: "Start with a local profile and keep your data on this device, or sign in when you want an account.",
-            detail: "You can change settings, reminders, and appearance later."
-        ),
-    ]
-
-    private var palette: OneTheme.Palette {
-        OneTheme.palette(for: colorScheme)
-    }
-
-    var body: some View {
-        ZStack {
-            OneScreenBackground(palette: palette)
-            VStack(spacing: OneSpacing.lg) {
-                TabView(selection: $page) {
-                    ForEach(Array(pages.enumerated()), id: \.offset) { index, content in
-                        VStack(alignment: .leading, spacing: OneSpacing.lg) {
-                            Spacer(minLength: 48)
-                            OneMarkBadge(palette: palette)
-                            Image(systemName: content.symbol)
-                                .font(.system(size: 30, weight: .semibold))
-                                .foregroundStyle(palette.highlight)
-                            Text(content.title)
-                                .font(OneType.largeTitle)
-                                .foregroundStyle(palette.text)
-                            Text(content.body)
-                                .font(OneType.body)
-                                .foregroundStyle(palette.text)
-                                .fixedSize(horizontal: false, vertical: true)
-                            Text(content.detail)
-                                .font(OneType.secondary)
-                                .foregroundStyle(palette.subtext)
-                                .fixedSize(horizontal: false, vertical: true)
-                            Spacer()
-                        }
-                        .padding(.horizontal, OneSpacing.lg)
-                        .tag(index)
-                    }
-                }
-                #if os(iOS)
-                .tabViewStyle(.page(indexDisplayMode: .always))
-                #else
-                .tabViewStyle(.automatic)
-                #endif
-
-                VStack(spacing: OneSpacing.sm) {
-                    OneActionButton(
-                        palette: palette,
-                        title: page == pages.count - 1 ? "Start using One" : "Continue",
-                        style: .primary
-                    ) {
-                        if page == pages.count - 1 {
-                            onComplete()
-                        } else {
-                            withAnimation(OneMotion.animation(.stateChange)) {
-                                page += 1
-                            }
-                        }
-                    }
-                    if page > 0 {
-                        OneActionButton(palette: palette, title: "Back", style: .secondary) {
-                            withAnimation(OneMotion.animation(.dismiss)) {
-                                page -= 1
-                            }
-                        }
-                    }
-                }
-                .padding(.horizontal, OneSpacing.lg)
-                .padding(.bottom, 28)
-            }
-        }
-    }
-}
-
 private struct LocalProfileSetupView: View {
     private enum AccessMode {
         case local
@@ -752,11 +1019,11 @@ private struct LocalProfileSetupView: View {
     private var title: String {
         switch accessMode {
         case .local?:
-            return localProfileCandidate == nil ? "Use this iPhone" : "Welcome back"
+            return localProfileCandidate == nil ? "Use This iPhone" : "Welcome Back"
         case .signIn?:
-            return "Sign in"
+            return "Sign In"
         case .createAccount?:
-            return "Create account"
+            return "Create Account"
         case nil:
             return "Welcome to One"
         }
@@ -779,113 +1046,40 @@ private struct LocalProfileSetupView: View {
 
     var body: some View {
         NavigationStack {
-            List {
-                if accessMode == nil {
-                    Section {
-                        Button("Use this iPhone") {
-                            accessMode = .local
+            OneScrollScreen(palette: palette, bottomPadding: 36) {
+                OneGlassCard(palette: palette, padding: OneSpacing.lg) {
+                    HStack(alignment: .top, spacing: OneSpacing.md) {
+                        OneMarkBadge(palette: palette)
+                        VStack(alignment: .leading, spacing: OneSpacing.xs) {
+                            Text(title)
+                                .font(OneType.largeTitle)
+                                .foregroundStyle(palette.text)
+                            Text(subtitle)
+                                .font(OneType.body)
+                                .foregroundStyle(palette.subtext)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
-                        Button("Use account") {
-                            accessMode = .signIn
-                        }
-                    } footer: {
-                        Text("Start locally if you want to keep your data on this device, or use an account for future portability.")
-                    }
-                } else {
-                    switch accessMode {
-                    case .local?:
-                        if let localProfileCandidate {
-                            Section {
-                                Text(localProfileCandidate.displayName)
-                                LabeledContent("Time zone", value: deviceTimezoneID)
-                                Button("Continue as \(localProfileCandidate.displayName)") {
-                                    Task {
-                                        await viewModel.resumeLocalProfile()
-                                    }
-                                }
-                                .disabled(viewModel.isLoading)
-                            } header: {
-                                Text("This iPhone")
-                            } footer: {
-                                Text("Continue with the profile already saved on this iPhone.")
-                            }
-                        } else {
-                            Section {
-                                TextField("Your name", text: $displayName)
-                                LabeledContent("Time zone", value: deviceTimezoneID)
-                                Button("Continue on this iPhone") {
-                                    Task {
-                                        await viewModel.createLocalProfile(
-                                            displayName: displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-                                        )
-                                    }
-                                }
-                                .disabled(displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || viewModel.isLoading)
-                            } header: {
-                                Text("This iPhone")
-                            } footer: {
-                                Text("This profile stays on this iPhone.")
-                            }
-                        }
-                    case .signIn?:
-                        Section {
-                            TextField("name@example.com", text: $email)
-                            SecureField("Password", text: $password)
-                            Button("Sign in") {
-                                Task {
-                                    await viewModel.login(
-                                        email: email.trimmingCharacters(in: .whitespacesAndNewlines),
-                                        password: password
-                                    )
-                                }
-                            }
-                            .disabled(email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || password.isEmpty || viewModel.isLoading)
-                        } header: {
-                            Text("Account")
-                        } footer: {
-                            Text("Use your account to keep data available on future devices.")
-                        }
-                    case .createAccount?:
-                        Section {
-                            TextField("Your name", text: $displayName)
-                            TextField("name@example.com", text: $email)
-                            SecureField("Create a password", text: $password)
-                            LabeledContent("Time zone", value: deviceTimezoneID)
-                            Button("Create account") {
-                                Task {
-                                    await viewModel.signup(
-                                        email: email.trimmingCharacters(in: .whitespacesAndNewlines),
-                                        password: password,
-                                        displayName: displayName.trimmingCharacters(in: .whitespacesAndNewlines),
-                                        timezone: deviceTimezoneID
-                                    )
-                                }
-                            }
-                            .disabled(
-                                displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-                                email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-                                password.isEmpty ||
-                                viewModel.isLoading
-                            )
-                        } header: {
-                            Text("Create account")
-                        }
-                    case nil:
-                        EmptyView()
                     }
                 }
 
+                switch accessMode {
+                case .local?:
+                    localAccessCard
+                case .signIn?:
+                    signInCard
+                case .createAccount?:
+                    createAccountCard
+                case nil:
+                    localFirstEntry
+                }
+
                 if let message = viewModel.errorMessage {
-                    Section {
-                        InlineStatusCard(message: message, kind: .danger, palette: palette)
-                            .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
-                    }
+                    InlineStatusCard(message: message, kind: .danger, palette: palette)
                 }
             }
-            .scrollContentBackground(.hidden)
-            .background(OneScreenBackground(palette: palette))
             .navigationTitle(title)
             .oneNavigationBarDisplayMode(.large)
+            .oneKeyboardDismissible()
             .toolbar {
                 if accessMode != nil {
                     ToolbarItem(placement: .oneNavigationLeading) {
@@ -922,39 +1116,222 @@ private struct LocalProfileSetupView: View {
     private func hydrateFromProfileCandidate() {
         if let localProfileCandidate {
             displayName = localProfileCandidate.displayName
-            if accessMode == nil {
-                accessMode = .local
-            }
         }
         if localProfileCandidate == nil && accessMode == .local {
             email = ""
             password = ""
         }
     }
+
+    @ViewBuilder
+    private var localFirstEntry: some View {
+        if localProfileCandidate == nil {
+            OneSurfaceCard(palette: palette) {
+                OneSectionHeading(palette: palette, title: "Start on this iPhone", meta: "Recommended")
+                VStack(alignment: .leading, spacing: OneSpacing.xs) {
+                    Text("Your name")
+                        .font(OneType.label)
+                        .foregroundStyle(palette.subtext)
+                    TextField("Your name", text: $displayName)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 12)
+                        .background(
+                            RoundedRectangle(cornerRadius: OneTheme.radiusMedium, style: .continuous)
+                                .fill(palette.surfaceMuted)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: OneTheme.radiusMedium, style: .continuous)
+                                .stroke(palette.border, lineWidth: 1)
+                        )
+                        .foregroundStyle(palette.text)
+                }
+                LabeledContent("Time zone", value: deviceTimezoneID)
+                    .font(OneType.secondary)
+                    .foregroundStyle(palette.subtext)
+                OneActionButton(
+                    palette: palette,
+                    title: viewModel.isLoading ? "Starting..." : "Continue on This iPhone",
+                    style: .primary
+                ) {
+                    Task {
+                        await viewModel.createLocalProfile(
+                            displayName: displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+                        )
+                    }
+                }
+                .disabled(displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || viewModel.isLoading)
+            }
+        } else {
+            localAccessCard
+        }
+
+        OneSurfaceCard(palette: palette) {
+            OneSectionHeading(palette: palette, title: "Use an account", meta: "Optional")
+            Text("Choose this when you want to sign in or create an account for future portability.")
+                .font(OneType.secondary)
+                .foregroundStyle(palette.subtext)
+                .fixedSize(horizontal: false, vertical: true)
+            OneActionButton(palette: palette, title: "Sign In", style: .secondary) {
+                accessMode = .signIn
+            }
+            Button("Create Account") {
+                accessMode = .createAccount
+            }
+            .font(OneType.label)
+            .foregroundStyle(palette.accent)
+        }
+    }
+
+    @ViewBuilder
+    private var localAccessCard: some View {
+        OneSurfaceCard(palette: palette) {
+            OneSectionHeading(palette: palette, title: "This iPhone", meta: localProfileCandidate == nil ? "Local profile" : "Saved profile")
+            if let localProfileCandidate {
+                Text(localProfileCandidate.displayName)
+                    .font(OneType.title)
+                    .foregroundStyle(palette.text)
+                Text("Your profile and data are still on this iPhone.")
+                    .font(OneType.secondary)
+                    .foregroundStyle(palette.subtext)
+                LabeledContent("Time zone", value: deviceTimezoneID)
+                    .font(OneType.secondary)
+                    .foregroundStyle(palette.subtext)
+                OneActionButton(
+                    palette: palette,
+                    title: viewModel.isLoading ? "Continuing..." : "Continue as \(localProfileCandidate.displayName)",
+                    style: .primary
+                ) {
+                    Task {
+                        await viewModel.resumeLocalProfile()
+                    }
+                }
+                .disabled(viewModel.isLoading)
+            } else {
+                VStack(alignment: .leading, spacing: OneSpacing.xs) {
+                    Text("Your name")
+                        .font(OneType.label)
+                        .foregroundStyle(palette.subtext)
+                    TextField("Your name", text: $displayName)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 12)
+                        .background(
+                            RoundedRectangle(cornerRadius: OneTheme.radiusMedium, style: .continuous)
+                                .fill(palette.surfaceMuted)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: OneTheme.radiusMedium, style: .continuous)
+                                .stroke(palette.border, lineWidth: 1)
+                        )
+                        .foregroundStyle(palette.text)
+                }
+                LabeledContent("Time zone", value: deviceTimezoneID)
+                    .font(OneType.secondary)
+                    .foregroundStyle(palette.subtext)
+                OneActionButton(
+                    palette: palette,
+                    title: viewModel.isLoading ? "Starting..." : "Continue on This iPhone",
+                    style: .primary
+                ) {
+                    Task {
+                        await viewModel.createLocalProfile(
+                            displayName: displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+                        )
+                    }
+                }
+                .disabled(displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || viewModel.isLoading)
+            }
+        }
+    }
+
+    private var signInCard: some View {
+        OneSurfaceCard(palette: palette) {
+            OneSectionHeading(palette: palette, title: "Account", meta: "Sync later")
+            OneField(title: "Email", text: $email, placeholder: "name@example.com")
+            OneSecureField(title: "Password", text: $password, placeholder: "Password")
+            OneActionButton(
+                palette: palette,
+                title: viewModel.isLoading ? "Signing In..." : "Sign In",
+                style: .primary
+            ) {
+                Task {
+                    await viewModel.login(
+                        email: email.trimmingCharacters(in: .whitespacesAndNewlines),
+                        password: password
+                    )
+                }
+            }
+            .disabled(email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || password.isEmpty || viewModel.isLoading)
+        }
+    }
+
+    private var createAccountCard: some View {
+        OneSurfaceCard(palette: palette) {
+            OneSectionHeading(palette: palette, title: "Create account", meta: "Optional")
+            VStack(alignment: .leading, spacing: OneSpacing.xs) {
+                Text("Your name")
+                    .font(OneType.label)
+                    .foregroundStyle(palette.subtext)
+                TextField("Your name", text: $displayName)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 12)
+                    .background(
+                        RoundedRectangle(cornerRadius: OneTheme.radiusMedium, style: .continuous)
+                            .fill(palette.surfaceMuted)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: OneTheme.radiusMedium, style: .continuous)
+                            .stroke(palette.border, lineWidth: 1)
+                    )
+                    .foregroundStyle(palette.text)
+            }
+            OneField(title: "Email", text: $email, placeholder: "name@example.com")
+            OneSecureField(title: "Password", text: $password, placeholder: "Create a password")
+            LabeledContent("Time zone", value: deviceTimezoneID)
+                .font(OneType.secondary)
+                .foregroundStyle(palette.subtext)
+            OneActionButton(
+                palette: palette,
+                title: viewModel.isLoading ? "Creating..." : "Create Account",
+                style: .primary
+            ) {
+                Task {
+                    await viewModel.signup(
+                        email: email.trimmingCharacters(in: .whitespacesAndNewlines),
+                        password: password,
+                        displayName: displayName.trimmingCharacters(in: .whitespacesAndNewlines),
+                        timezone: deviceTimezoneID
+                    )
+                }
+            }
+            .disabled(
+                displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                password.isEmpty ||
+                viewModel.isLoading
+            )
+        }
+    }
 }
 
-private struct HomeTabView: View {
-    let user: User?
-    @ObservedObject var tasksViewModel: TasksViewModel
-    @ObservedObject var todayViewModel: TodayViewModel
+private struct ReviewTabView: View {
     @ObservedObject var analyticsViewModel: AnalyticsViewModel
+    @ObservedObject var notesViewModel: NotesViewModel
     @ObservedObject var coachViewModel: CoachViewModel
     let currentDateLocal: String
-    let onFocusToday: () -> Void
+    let weekStart: Int
+    let onSelectPeriod: (PeriodType) async -> Void
     let onOpenSheet: (OneAppShell.SheetRoute) -> Void
+    let onOpenCoach: () -> Void
+    let onRefreshAnalytics: () async -> Void
+    let onRefreshReflections: () async -> Void
 
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var activeRailSection: ReviewUtilityRailSection = .review
+    private let periodOptions: [PeriodType] = [.daily, .weekly, .monthly, .yearly]
 
     private var palette: OneTheme.Palette {
         OneTheme.palette(for: colorScheme)
-    }
-
-    private var urgentItem: TodayItem? {
-        todayViewModel.items.first(where: { ($0.isPinned ?? false) && !$0.completed })
-    }
-
-    private var nextItem: TodayItem? {
-        urgentItem ?? todayViewModel.items.first(where: { !$0.completed })
     }
 
     private var featuredCoachCard: CoachCard? {
@@ -967,153 +1344,832 @@ private struct HomeTabView: View {
         return coachViewModel.cards[seed % coachViewModel.cards.count]
     }
 
-    private var momentumLine: String {
-        if todayViewModel.totalCount == 0 {
-            return "Nothing is planned yet."
+    private var prioritizedCoachCards: [CoachCard] {
+        guard let featuredCoachCard,
+              let featuredIndex = coachViewModel.cards.firstIndex(where: { $0.id == featuredCoachCard.id }) else {
+            return coachViewModel.cards
         }
-        if todayViewModel.completionRatio == 1 {
-            return "You finished what you planned today."
+        return Array(coachViewModel.cards[featuredIndex...]) + Array(coachViewModel.cards[..<featuredIndex])
+    }
+
+    private var supportingCoachCards: [CoachCard] {
+        Array(prioritizedCoachCards.dropFirst().prefix(3))
+    }
+
+    private var primarySummary: PeriodSummary? {
+        analyticsViewModel.summary ?? analyticsViewModel.weekly
+    }
+
+    private var displayedPeriod: PeriodType {
+        analyticsViewModel.pendingPeriod ?? analyticsViewModel.selectedPeriod
+    }
+
+    private var reviewHeadline: String {
+        guard let summary = primarySummary else {
+            return "Review turns daily execution into visible progress."
         }
-        if todayViewModel.completedCount == 0 {
-            return "A clear start matters more than a busy one."
+        if summary.periodType == .daily {
+            if summary.completedItems == 0 {
+                return "Today still needs a first completion."
+            }
+            return "Today shows \(summary.completedItems) finished step\(summary.completedItems == 1 ? "" : "s")."
         }
-        return "Progress is already moving."
+        if summary.completionRate >= 0.8 {
+            return "Momentum is holding through this \(periodTitle(summary.periodType).lowercased())."
+        }
+        if summary.activeDays == 0 {
+            return "This \(periodTitle(summary.periodType).lowercased()) has not started moving yet."
+        }
+        return "Review what changed, then keep the next step small and clear."
+    }
+
+    private var summaryNoteCount: String {
+        "\(notesViewModel.sentimentSummary?.noteCount ?? 0)"
+    }
+
+    private var summaryActiveDays: String {
+        "\(notesViewModel.sentimentSummary?.activeDays ?? 0)"
+    }
+
+    private var moodNoteCount: String {
+        "\(analyticsViewModel.sentimentOverview?.distribution.reduce(0) { $0 + $1.count } ?? 0)"
+    }
+
+    private var dominantSummaryTitle: String {
+        notesViewModel.sentimentSummary?.dominant?.title ?? "None"
+    }
+
+    private var reviewEquation: String {
+        guard let summary = primarySummary else {
+            return "Completion Rate = Completed / Planned"
+        }
+        return "Completion Rate = \(summary.completedItems) / \(summary.expectedItems) = \(Int((summary.completionRate * 100).rounded()))%"
+    }
+
+    private var selectedDayEntryTitle: String {
+        let count = notesViewModel.selectedDayNotes.count
+        if count == 0 {
+            return "No notes on \(notesViewModel.selectedDayTitle)"
+        }
+        if count == 1 {
+            return "1 note on \(notesViewModel.selectedDayTitle)"
+        }
+        return "\(count) notes on \(notesViewModel.selectedDayTitle)"
+    }
+
+    private var contributionMeta: String {
+        switch analyticsViewModel.selectedPeriod {
+        case .weekly:
+            return "Full selected week"
+        case .monthly:
+            return analyticsViewModel.selectedMonthWeekDetailLabel ?? "Selected week"
+        case .yearly:
+            return "Full year"
+        case .daily:
+            return "Selected day"
+        }
+    }
+
+    private var reviewNavigationTitle: String {
+        activeRailSection == .review ? "Review" : activeRailSection.railItem.title
     }
 
     var body: some View {
         NavigationStack {
-            OneScrollScreen(
-                palette: palette,
-                bottomPadding: OneDockLayout.tabScreenBottomPadding
-            ) {
+            ZStack(alignment: .top) {
+                currentReviewPage
+                    .id(activeRailSection)
+                    .safeAreaInset(edge: .top) {
+                        Color.clear
+                            .frame(height: OneUtilityRailMetrics.persistentTopInset)
+                    }
+                    .transition(.opacity)
+
+                OneUtilityRail(
+                    palette: palette,
+                    items: ReviewUtilityRailSection.railItems,
+                    activeID: activeRailSection,
+                    isSticky: true
+                ) { section in
+                    OneHaptics.shared.trigger(.selectionChanged)
+                    withAnimation(OneMotion.animation(.stateChange, reduceMotion: reduceMotion)) {
+                        activeRailSection = section
+                    }
+                }
+                .padding(.horizontal, OneUtilityRailMetrics.stickyHorizontalInset)
+                .padding(.top, OneUtilityRailMetrics.stickyTopPadding)
+                .zIndex(1)
+            }
+            .animation(OneMotion.animation(.stateChange, reduceMotion: reduceMotion), value: activeRailSection)
+            .navigationTitle(reviewNavigationTitle)
+            .oneNavigationBarDisplayMode(.large)
+            .task(id: "\(currentDateLocal)-\(weekStart)") {
+                await bootstrapReview()
+            }
+            .task(id: activeRailSection.rawValue) {
+                guard activeRailSection == .coach, coachViewModel.cards.isEmpty else {
+                    return
+                }
+                await coachViewModel.load()
+            }
+        }
+    }
+
+    private var chartHighlightIndex: Int? {
+        switch analyticsViewModel.selectedPeriod {
+        case .daily:
+            return analyticsViewModel.dailySummaries.indices.first
+        case .weekly:
+            return analyticsViewModel.dailySummaries.lastIndex(where: { $0.dateLocal == currentDateLocal })
+        case .monthly:
+            guard let selectedMonthWeek = analyticsViewModel.selectedMonthWeek else {
+                return nil
+            }
+            return max(0, selectedMonthWeek - 1)
+        case .yearly:
+            return analyticsViewModel.chartSeries.labels.indices.last
+        }
+    }
+
+    private func bootstrapReview() async {
+        if analyticsViewModel.weekly == nil {
+            await analyticsViewModel.loadWeekly(anchorDate: currentDateLocal, weekStart: weekStart)
+        }
+        if analyticsViewModel.summary == nil {
+            await onSelectPeriod(analyticsViewModel.selectedPeriod)
+        }
+        await notesViewModel.load(
+            anchorDate: notesViewModel.selectedDateLocal,
+            periodType: analyticsViewModel.selectedPeriod,
+            weekStart: weekStart,
+            forceReload: notesViewModel.allNotes.isEmpty
+        )
+    }
+
+    private func selectReviewPeriod(_ selection: PeriodType) async {
+        await onSelectPeriod(selection)
+        await notesViewModel.load(
+            anchorDate: notesViewModel.selectedDateLocal,
+            periodType: analyticsViewModel.selectedPeriod,
+            weekStart: weekStart,
+            forceReload: notesViewModel.allNotes.isEmpty
+        )
+    }
+
+    private func selectDate(_ dateLocal: String) {
+        notesViewModel.selectDay(dateLocal)
+        withAnimation(OneMotion.animation(.stateChange, reduceMotion: reduceMotion)) {
+            activeRailSection = .notes
+        }
+    }
+
+    @ViewBuilder
+    private var currentReviewPage: some View {
+        switch activeRailSection {
+        case .review:
+            reviewPage {
                 OneGlassCard(palette: palette, padding: OneSpacing.lg) {
-                    HStack(alignment: .top, spacing: OneSpacing.md) {
-                        VStack(alignment: .leading, spacing: OneSpacing.sm) {
-                            Text("Today")
-                                .font(OneType.label)
-                                .foregroundStyle(palette.subtext)
-                            Text(nextItem?.title ?? "A calm briefing for the day")
-                                .font(OneType.title)
-                                .foregroundStyle(palette.text)
-                            Text("\(todayViewModel.completedCount) completed of \(todayViewModel.totalCount) planned")
+                    Text("Review")
+                        .font(OneType.label)
+                        .foregroundStyle(palette.subtext)
+                    Text(reviewHeadline)
+                        .font(OneType.title)
+                        .foregroundStyle(palette.text)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: OneSpacing.sm) {
+                        SummaryMetricTile(palette: palette, title: "Completed", value: "\(primarySummary?.completedItems ?? 0)")
+                        SummaryMetricTile(palette: palette, title: "Planned", value: "\(primarySummary?.expectedItems ?? 0)")
+                        SummaryMetricTile(palette: palette, title: "Rate", value: "\(Int(((primarySummary?.completionRate ?? 0) * 100).rounded()))%")
+                        SummaryMetricTile(palette: palette, title: "Consistency", value: "\(Int(((primarySummary?.consistencyScore ?? 0) * 100).rounded()))%")
+                    }
+                }
+
+                OneSurfaceCard(palette: palette) {
+                    OneSegmentedControl(
+                        palette: palette,
+                        options: periodOptions,
+                        selection: displayedPeriod,
+                        title: { periodTitle($0) }
+                    ) { selection in
+                        Task {
+                            await selectReviewPeriod(selection)
+                        }
+                    }
+                    if analyticsViewModel.isSwitchingPeriod {
+                        HStack(spacing: OneSpacing.sm) {
+                            ProgressView()
+                                .tint(palette.accent)
+                            Text("Updating \(displayedPeriod.rawValue) view")
                                 .font(OneType.secondary)
                                 .foregroundStyle(palette.subtext)
-                            Text(momentumLine)
-                                .font(OneType.body)
-                                .foregroundStyle(palette.text)
-                                .fixedSize(horizontal: false, vertical: true)
-                            if let nextItem {
-                                HStack(spacing: 8) {
-                                    Text(nextItem.priorityTier.title)
-                                        .font(OneType.caption.weight(.semibold))
-                                        .foregroundStyle(nextItem.priorityTier == .urgent ? palette.danger : palette.highlight)
-                                    Text(nextItem.itemType == .habit ? "Habit" : "Task")
-                                        .font(OneType.caption)
-                                        .foregroundStyle(palette.subtext)
-                                }
-                            } else {
-                                Text("Open Today to start adding habits or tasks.")
-                                    .font(OneType.caption)
-                                    .foregroundStyle(palette.subtext)
-                            }
-                            OneActionButton(palette: palette, title: "Open Today", style: .primary) {
-                                OneHaptics.shared.trigger(.selectionChanged)
-                                onFocusToday()
-                            }
                         }
-                        Spacer()
-                        VStack(alignment: .trailing, spacing: 12) {
-                            OneProgressCluster(
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+
+                OneSurfaceCard(palette: palette) {
+                    OneSectionHeading(
+                        palette: palette,
+                        title: "History",
+                        meta: contributionMeta
+                    )
+                    Group {
+                        if analyticsViewModel.dailySummaries.isEmpty {
+                            Text("Your progress history will appear here after the first completions.")
+                                .font(OneType.secondary)
+                                .foregroundStyle(palette.subtext)
+                        } else if analyticsViewModel.selectedPeriod == .yearly {
+                            AnalyticsYearContributionView(
                                 palette: palette,
-                                progress: todayViewModel.completionRatio,
-                                label: "\(Int(todayViewModel.completionRatio * 100))%"
+                                sections: analyticsViewModel.contributionSections,
+                                onSelectDate: { dateLocal in
+                                    selectDate(dateLocal)
+                                }
                             )
-                            if todayViewModel.completionRatio == 1 {
-                                Label("Closed", systemImage: "checkmark.circle.fill")
-                                    .font(OneType.caption.weight(.semibold))
-                                    .foregroundStyle(palette.highlight)
-                            } else if let nextItem {
-                                Text(nextItem.priorityTier == .urgent ? "Needs attention" : "In motion")
-                                    .font(OneType.caption.weight(.semibold))
-                                    .foregroundStyle(nextItem.priorityTier == .urgent ? palette.danger : palette.highlight)
-                            }
+                        } else {
+                            AnalyticsContributionGrid(
+                                palette: palette,
+                                summaries: analyticsViewModel.dailySummaries,
+                                onSelectDate: { dateLocal in
+                                    selectDate(dateLocal)
+                                }
+                            )
                         }
                     }
-                }
-
-                OneSurfaceCard(palette: palette) {
-                    OneSectionHeading(palette: palette, title: "This week", meta: analyticsViewModel.weekly?.periodStart ?? "")
-                    if analyticsViewModel.weeklyDailySummaries.isEmpty {
-                        Text("Complete a few habits or tasks to build a weekly summary.")
-                            .font(OneType.secondary)
-                            .foregroundStyle(palette.subtext)
-                    } else {
-                        OneActivityLane(
-                            palette: palette,
-                            values: analyticsViewModel.weeklyDailySummaries.map(\.completionRate),
-                            labels: analyticsViewModel.weeklyDailySummaries.map { OneDate.shortWeekday(from: $0.dateLocal) },
-                            highlightIndex: analyticsViewModel.weeklyDailySummaries.lastIndex(where: { $0.dateLocal == currentDateLocal })
-                        )
-                        HStack(spacing: OneSpacing.sm) {
-                            SummaryMetricTile(palette: palette, title: "Completed", value: "\(analyticsViewModel.weekly?.completedItems ?? 0)")
-                            SummaryMetricTile(palette: palette, title: "Consistency", value: "\(Int((analyticsViewModel.weekly?.consistencyScore ?? 0) * 100))%")
-                            SummaryMetricTile(palette: palette, title: "Active Days", value: "\(analyticsViewModel.weekly?.activeDays ?? 0)")
-                        }
-                    }
-                }
-
-                OneSurfaceCard(palette: palette) {
-                    OneSectionHeading(palette: palette, title: "Continue", meta: nil)
-                    Button {
-                        OneHaptics.shared.trigger(.sheetPresented)
-                        onOpenSheet(.notes(anchorDate: currentDateLocal, periodType: .daily))
-                    } label: {
-                        OneSettingsRow(
-                            palette: palette,
-                            icon: "note.text",
-                            title: "Notes",
-                            meta: "Review reflections away from Today.",
-                            tail: nil
-                        )
-                    }
-                    .onePressable(scale: 0.992)
-
-                    Divider().overlay(palette.border)
-
-                    Button {
-                        OneHaptics.shared.trigger(.sheetPresented)
-                        onOpenSheet(.coach)
-                    } label: {
-                        OneSettingsRow(
-                            palette: palette,
-                            icon: "sparkles",
-                            title: "Coach",
-                            meta: featuredCoachCard?.title ?? "Daily guidance that stays secondary.",
-                            tail: nil
-                        )
-                    }
-                    .onePressable(scale: 0.992)
                 }
             }
-            .navigationTitle("Home")
-            .oneNavigationBarDisplayMode(.large)
-            .toolbar {
-                ToolbarItem(placement: .oneNavigationTrailing) {
-                    Menu {
-                        Button("Add task") {
-                            OneHaptics.shared.trigger(.sheetPresented)
-                            onOpenSheet(.addTodo)
-                        }
-                        Button("Add habit") {
-                            OneHaptics.shared.trigger(.sheetPresented)
-                            onOpenSheet(.addHabit)
-                        }
+        case .notes:
+            reviewPage {
+                notesSection
+            }
+        case .coach:
+            reviewPage {
+                coachPageContent
+            }
+        case .trend:
+            reviewPage {
+                trendPageContent
+            }
+        case .split:
+            reviewPage {
+                splitPageContent
+            }
+        case .recovery:
+            reviewPage {
+                recoveryPageContent
+            }
+        }
+    }
+
+    private func reviewPage<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        OneScrollScreen(
+            palette: palette,
+            bottomPadding: OneDockLayout.tabScreenBottomPadding
+        ) {
+            content()
+
+            if let message = analyticsViewModel.errorMessage ?? notesViewModel.errorMessage {
+                InlineStatusCard(message: message, kind: .danger, palette: palette)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var trendPageContent: some View {
+        if let summary = primarySummary {
+            OneSurfaceCard(palette: palette) {
+                OneSectionHeading(palette: palette, title: "Trend", meta: periodTitle(summary.periodType))
+                HStack(spacing: OneSpacing.sm) {
+                    SummaryMetricTile(palette: palette, title: "Active Days", value: "\(summary.activeDays)")
+                    SummaryMetricTile(palette: palette, title: "Rate", value: "\(Int(summary.completionRate * 100))%")
+                    SummaryMetricTile(palette: palette, title: "Gap", value: "\(max(summary.expectedItems - summary.completedItems, 0))")
+                }
+                if analyticsViewModel.chartSeries.values.isEmpty {
+                    Text("Complete a few habits or tasks to build this view.")
+                        .font(OneType.secondary)
+                        .foregroundStyle(palette.subtext)
+                } else {
+                    OneActivityLane(
+                        palette: palette,
+                        values: analyticsViewModel.chartSeries.values,
+                        labels: analyticsViewModel.chartSeries.labels,
+                        highlightIndex: chartHighlightIndex,
+                        onSelectIndex: analyticsViewModel.selectedPeriod == .monthly ? { index in
+                            analyticsViewModel.selectMonthWeek(index + 1)
+                        } : nil
+                    )
+                }
+                ReviewEquationStrip(
+                    palette: palette,
+                    title: "Execution Equation",
+                    equation: reviewEquation
+                )
+            }
+        }
+
+        if let sentimentOverview = analyticsViewModel.sentimentOverview {
+            OneSurfaceCard(palette: palette) {
+                OneSectionHeading(
+                    palette: palette,
+                    title: "Mood signal",
+                    meta: sentimentOverview.dominant?.title ?? "No dominant pattern"
+                )
+                HStack(spacing: OneSpacing.sm) {
+                    SummaryMetricTile(palette: palette, title: "Notes", value: moodNoteCount)
+                    SummaryMetricTile(
+                        palette: palette,
+                        title: "Active Days",
+                        value: "\(sentimentOverview.trend.filter { $0.sentiment != nil }.count)"
+                    )
+                    SummaryMetricTile(
+                        palette: palette,
+                        title: "Dominant",
+                        value: sentimentOverview.dominant?.title ?? "None"
+                    )
+                }
+                AnalyticsSentimentOverviewView(
+                    palette: palette,
+                    periodType: analyticsViewModel.selectedPeriod,
+                    overview: sentimentOverview,
+                    highlightedDates: analyticsViewModel.selectedPeriod == .monthly ? Set(analyticsViewModel.dailySummaries.map(\.dateLocal)) : [],
+                    onOpenDate: { dateLocal in
+                        selectDate(dateLocal)
+                    }
+                )
+            }
+        }
+    }
+
+    private var splitPageContent: some View {
+        OneSurfaceCard(palette: palette) {
+            OneSectionHeading(palette: palette, title: "Execution Split", meta: "Habits versus tasks")
+            if analyticsViewModel.executionRows.isEmpty {
+                Text("Habit and task mix appears after the first planned items.")
+                    .font(OneType.secondary)
+                    .foregroundStyle(palette.subtext)
+            } else {
+                ReviewTableHeader(palette: palette, columns: ["Track", "Done", "Planned", "Rate"])
+                ForEach(analyticsViewModel.executionRows) { row in
+                    ReviewExecutionRow(palette: palette, row: row)
+                }
+            }
+        }
+    }
+
+    private var recoveryPageContent: some View {
+        OneSurfaceCard(palette: palette) {
+            OneSectionHeading(palette: palette, title: "Recovery Opportunities", meta: "Largest execution gaps")
+            if analyticsViewModel.recoveryRows.isEmpty {
+                Text("Opportunity rows appear when the current period has planned work.")
+                    .font(OneType.secondary)
+                    .foregroundStyle(palette.subtext)
+            } else {
+                ReviewTableHeader(palette: palette, columns: ["Span", "Gap", "Done/Plan", "Rate"])
+                ForEach(analyticsViewModel.recoveryRows) { row in
+                    ReviewRecoveryRow(palette: palette, row: row)
+                }
+            }
+        }
+    }
+
+    private func scrollToSection(_ section: ReviewUtilityRailSection, scrollProxy: ScrollViewProxy) {
+        OneHaptics.shared.trigger(.selectionChanged)
+        activeRailSection = section
+        withAnimation(OneMotion.animation(.stateChange, reduceMotion: reduceMotion)) {
+            scrollProxy.scrollTo(OneUtilityRailAnchor(sectionID: section), anchor: .top)
+        }
+    }
+
+    private func periodTitle(_ period: PeriodType) -> String {
+        switch period {
+        case .daily:
+            return "Day"
+        case .weekly:
+            return "Week"
+        case .monthly:
+            return "Month"
+        case .yearly:
+            return "Year"
+        }
+    }
+
+    private func notesPeriodTitle(_ period: PeriodType) -> String {
+        periodTitle(period)
+    }
+
+    @ViewBuilder
+    private func reviewSection<Content: View>(
+        id: ReviewUtilityRailSection,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(spacing: OneSpacing.md) {
+            Color.clear
+                .frame(height: OneUtilityRailMetrics.anchorOffset)
+                .padding(.bottom, -OneUtilityRailMetrics.anchorOffset)
+                .id(OneUtilityRailAnchor(sectionID: id))
+            content()
+        }
+        .oneUtilityRailMeasuredSection(id)
+    }
+
+    private var notesSection: some View {
+        OneSurfaceCard(palette: palette) {
+            VStack(alignment: .leading, spacing: OneSpacing.md) {
+                HStack(alignment: .top, spacing: OneSpacing.md) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        OneSectionHeading(
+                            palette: palette,
+                            title: "Notes",
+                            meta: notesPeriodTitle(notesViewModel.selectedPeriod)
+                        )
+                        Text(selectedDayEntryTitle)
+                            .font(OneType.secondary)
+                            .foregroundStyle(palette.subtext)
+                    }
+                    Spacer()
+                    Button("New Note") {
+                        OneHaptics.shared.trigger(.sheetPresented)
+                        onOpenSheet(.addNote(anchorDate: notesViewModel.selectedDateLocal))
+                    }
+                    .font(OneType.label)
+                    .foregroundStyle(palette.accent)
+                }
+
+                HStack(spacing: OneSpacing.sm) {
+                    SummaryMetricTile(palette: palette, title: "Notes", value: summaryNoteCount)
+                    SummaryMetricTile(palette: palette, title: "Active Days", value: summaryActiveDays)
+                    SummaryMetricTile(palette: palette, title: "Dominant", value: dominantSummaryTitle)
+                }
+
+                HStack(spacing: 14) {
+                    Button {
+                        OneHaptics.shared.trigger(.selectionChanged)
+                        notesViewModel.moveSelection(by: -1)
                     } label: {
-                        Image(systemName: "plus")
+                        Image(systemName: "chevron.left.circle.fill")
+                            .font(.system(size: 22, weight: .semibold))
+                            .foregroundStyle(palette.accent)
+                    }
+                    .onePressable(scale: 0.94)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(notesViewModel.currentRangeTitle)
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(palette.text)
+                        Text(notesViewModel.selectedDayTitle)
+                            .font(OneType.secondary)
+                            .foregroundStyle(palette.subtext)
+                    }
+
+                    Spacer()
+
+                    Button {
+                        OneHaptics.shared.trigger(.selectionChanged)
+                        notesViewModel.moveSelection(by: 1)
+                    } label: {
+                        Image(systemName: "chevron.right.circle.fill")
+                            .font(.system(size: 22, weight: .semibold))
+                            .foregroundStyle(palette.accent)
+                    }
+                    .onePressable(scale: 0.94)
+                }
+
+                switch notesViewModel.selectedPeriod {
+                case .daily:
+                    NotesFocusedDayCard(
+                        palette: palette,
+                        option: notesViewModel.dayOptions.first,
+                        selectedDateLocal: notesViewModel.selectedDateLocal
+                    ) { dateLocal in
+                        notesViewModel.selectDay(dateLocal)
+                    }
+                case .weekly:
+                    NotesDayStrip(
+                        palette: palette,
+                        options: notesViewModel.dayOptions,
+                        selectedDateLocal: notesViewModel.selectedDateLocal
+                    ) { dateLocal in
+                        notesViewModel.selectDay(dateLocal)
+                    }
+                case .monthly:
+                    NotesCalendarGridView(
+                        palette: palette,
+                        options: notesViewModel.dayOptions,
+                        leadingPlaceholders: notesViewModel.leadingPlaceholders,
+                        selectedDateLocal: notesViewModel.selectedDateLocal
+                    ) { dateLocal in
+                        notesViewModel.selectDay(dateLocal)
+                    }
+                case .yearly:
+                    VStack(alignment: .leading, spacing: OneSpacing.sm) {
+                        NotesMonthPickerView(
+                            palette: palette,
+                            options: notesViewModel.monthOptions,
+                            selectedMonth: notesViewModel.selectedYearMonth
+                        ) { month in
+                            notesViewModel.selectMonth(month)
+                        }
+                        NotesCalendarGridView(
+                            palette: palette,
+                            options: notesViewModel.dayOptions,
+                            leadingPlaceholders: notesViewModel.leadingPlaceholders,
+                            selectedDateLocal: notesViewModel.selectedDateLocal
+                        ) { dateLocal in
+                            notesViewModel.selectDay(dateLocal)
+                        }
+                    }
+                }
+
+                if let summary = notesViewModel.sentimentSummary, !summary.distribution.isEmpty {
+                    FlowLayout(spacing: 8) {
+                        ForEach(summary.distribution) { item in
+                            OneChip(
+                                palette: palette,
+                                title: "\(item.sentiment.title) \(item.count)",
+                                kind: item.sentiment.chipKind
+                            )
+                        }
+                    }
+                }
+
+                if notesViewModel.selectedDayNotes.isEmpty {
+                    EmptyStateCard(
+                        palette: palette,
+                        title: "No notes for this date",
+                        message: "Capture a short note when the day changes direction so Review stays useful when you return."
+                    )
+                } else {
+                    VStack(spacing: OneSpacing.sm) {
+                        ForEach(notesViewModel.selectedDayNotes) { note in
+                            QuickNoteRow(
+                                palette: palette,
+                                note: note
+                            ) {
+                                Task {
+                                    if await notesViewModel.delete(id: note.id) {
+                                        await onRefreshReflections()
+                                        await onRefreshAnalytics()
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
+    }
+
+    @ViewBuilder
+    private var coachPageContent: some View {
+        if let featuredCoachCard {
+            OneGlassCard(palette: palette) {
+                Text("Coach")
+                    .font(OneType.label)
+                    .foregroundStyle(palette.highlight)
+                Text(featuredCoachCard.title)
+                    .font(OneType.title)
+                    .foregroundStyle(palette.text)
+                Text(featuredCoachCard.body)
+                    .font(OneType.body)
+                    .foregroundStyle(palette.subtext)
+                    .fixedSize(horizontal: false, vertical: true)
+                CoachVerseBlock(palette: palette, card: featuredCoachCard)
+                if !featuredCoachCard.tags.isEmpty {
+                    FlowLayout(spacing: 8) {
+                        ForEach(featuredCoachCard.tags, id: \.self) { tag in
+                            OneChip(
+                                palette: palette,
+                                title: tag.capitalized,
+                                kind: .strong
+                            )
+                        }
+                    }
+                }
+            }
+
+            ForEach(Array(supportingCoachCards.enumerated()), id: \.element.id) { index, card in
+                OneSurfaceCard(palette: palette) {
+                    OneSectionHeading(
+                        palette: palette,
+                        title: index == 0 ? "Keep moving" : "Coach note",
+                        meta: nil
+                    )
+                    Text(card.title)
+                        .font(OneType.sectionTitle)
+                        .foregroundStyle(palette.text)
+                    Text(card.body)
+                        .font(OneType.body)
+                        .foregroundStyle(palette.subtext)
+                        .fixedSize(horizontal: false, vertical: true)
+                    CoachVerseBlock(palette: palette, card: card)
+                    if !card.tags.isEmpty {
+                        FlowLayout(spacing: 8) {
+                            ForEach(card.tags, id: \.self) { tag in
+                                OneChip(
+                                    palette: palette,
+                                    title: tag.capitalized,
+                                    kind: .neutral
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            OneSurfaceCard(palette: palette) {
+                OneSectionHeading(palette: palette, title: "Full Coach", meta: "Expanded guidance")
+                Text("Open the deeper coach workspace when you want the full set of supporting cards.")
+                    .font(OneType.secondary)
+                    .foregroundStyle(palette.subtext)
+                    .fixedSize(horizontal: false, vertical: true)
+                OneActionButton(palette: palette, title: "Open Full Coach", style: .secondary) {
+                    OneHaptics.shared.trigger(.sheetPresented)
+                    onOpenCoach()
+                }
+            }
+        } else {
+            EmptyStateCard(
+                palette: palette,
+                title: "Coach is still warming up",
+                message: "Guidance will appear here once the current review context has enough signal."
+            )
+        }
+
+        if let message = coachViewModel.errorMessage {
+            InlineStatusCard(message: message, kind: .danger, palette: palette)
+        }
+    }
+
+    @ViewBuilder
+    private func trendSection(scrollProxy: ScrollViewProxy) -> some View {
+        if let summary = primarySummary {
+            OneSurfaceCard(palette: palette) {
+                OneSectionHeading(palette: palette, title: "Trend", meta: periodTitle(summary.periodType))
+                HStack(spacing: OneSpacing.sm) {
+                    SummaryMetricTile(palette: palette, title: "Active Days", value: "\(summary.activeDays)")
+                    SummaryMetricTile(palette: palette, title: "Rate", value: "\(Int(summary.completionRate * 100))%")
+                    SummaryMetricTile(palette: palette, title: "Gap", value: "\(max(summary.expectedItems - summary.completedItems, 0))")
+                }
+                if analyticsViewModel.chartSeries.values.isEmpty {
+                    Text("Complete a few habits or tasks to build this view.")
+                        .font(OneType.secondary)
+                        .foregroundStyle(palette.subtext)
+                } else {
+                    OneActivityLane(
+                        palette: palette,
+                        values: analyticsViewModel.chartSeries.values,
+                        labels: analyticsViewModel.chartSeries.labels,
+                        highlightIndex: chartHighlightIndex,
+                        onSelectIndex: analyticsViewModel.selectedPeriod == .monthly ? { index in
+                            analyticsViewModel.selectMonthWeek(index + 1)
+                        } : nil
+                    )
+                }
+                ReviewEquationStrip(
+                    palette: palette,
+                    title: "Execution Equation",
+                    equation: reviewEquation
+                )
+            }
+        }
+
+        if let sentimentOverview = analyticsViewModel.sentimentOverview {
+            OneSurfaceCard(palette: palette) {
+                OneSectionHeading(
+                    palette: palette,
+                    title: "Mood signal",
+                    meta: sentimentOverview.dominant?.title ?? "No dominant pattern"
+                )
+                HStack(spacing: OneSpacing.sm) {
+                    SummaryMetricTile(palette: palette, title: "Notes", value: moodNoteCount)
+                    SummaryMetricTile(
+                        palette: palette,
+                        title: "Active Days",
+                        value: "\(sentimentOverview.trend.filter { $0.sentiment != nil }.count)"
+                    )
+                    SummaryMetricTile(
+                        palette: palette,
+                        title: "Dominant",
+                        value: sentimentOverview.dominant?.title ?? "None"
+                    )
+                }
+                AnalyticsSentimentOverviewView(
+                    palette: palette,
+                    periodType: analyticsViewModel.selectedPeriod,
+                    overview: sentimentOverview,
+                    highlightedDates: analyticsViewModel.selectedPeriod == .monthly ? Set(analyticsViewModel.dailySummaries.map(\.dateLocal)) : [],
+                    onOpenDate: { dateLocal in
+                        selectDate(dateLocal)
+                    }
+                )
+            }
+        }
+
+        if primarySummary == nil, analyticsViewModel.sentimentOverview == nil {
+            OneSurfaceCard(palette: palette) {
+                OneSectionHeading(palette: palette, title: "Trend", meta: nil)
+                Text("Trend details appear after a little more activity and note history are available.")
+                    .font(OneType.secondary)
+                    .foregroundStyle(palette.subtext)
+            }
+        }
+    }
+}
+
+private struct ReviewEquationStrip: View {
+    let palette: OneTheme.Palette
+    let title: String
+    let equation: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(OneType.caption.weight(.semibold))
+                .foregroundStyle(palette.subtext)
+            Text(equation)
+                .font(OneType.secondary.weight(.semibold))
+                .foregroundStyle(palette.text)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: OneTheme.radiusMedium, style: .continuous)
+                .fill(palette.surfaceMuted)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: OneTheme.radiusMedium, style: .continuous)
+                .stroke(palette.border, lineWidth: 1)
+        )
+    }
+}
+
+private struct ReviewTableHeader: View {
+    let palette: OneTheme.Palette
+    let columns: [String]
+
+    var body: some View {
+        HStack(spacing: OneSpacing.sm) {
+            ForEach(columns, id: \.self) { column in
+                Text(column)
+                    .font(OneType.caption.weight(.semibold))
+                    .foregroundStyle(palette.subtext)
+                    .frame(maxWidth: .infinity, alignment: column == columns.first ? .leading : .trailing)
+            }
+        }
+    }
+}
+
+private struct ReviewExecutionRow: View {
+    let palette: OneTheme.Palette
+    let row: AnalyticsExecutionSplitRow
+
+    var body: some View {
+        HStack(spacing: OneSpacing.sm) {
+            Text(row.title)
+                .font(OneType.body.weight(.semibold))
+                .foregroundStyle(palette.text)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text("\(row.completedItems)")
+                .font(OneType.secondary)
+                .foregroundStyle(palette.text)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+            Text("\(row.expectedItems)")
+                .font(OneType.secondary)
+                .foregroundStyle(palette.text)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+            Text("\(Int((row.completionRate * 100).rounded()))%")
+                .font(OneType.secondary.weight(.semibold))
+                .foregroundStyle(palette.subtext)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+private struct ReviewRecoveryRow: View {
+    let palette: OneTheme.Palette
+    let row: AnalyticsRecoveryRow
+
+    var body: some View {
+        HStack(spacing: OneSpacing.sm) {
+            Text(row.label)
+                .font(OneType.body.weight(.semibold))
+                .foregroundStyle(palette.text)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text("\(row.gap)")
+                .font(OneType.secondary.weight(.semibold))
+                .foregroundStyle(row.gap > 0 ? palette.warning : palette.subtext)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+            Text("\(row.completedItems)/\(row.expectedItems)")
+                .font(OneType.secondary)
+                .foregroundStyle(palette.text)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+            Text("\(Int((row.completionRate * 100).rounded()))%")
+                .font(OneType.secondary.weight(.semibold))
+                .foregroundStyle(palette.subtext)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+        }
+        .padding(.vertical, 4)
     }
 }
 
@@ -1122,14 +2178,17 @@ private struct TodayTabView: View {
     @ObservedObject var tasksViewModel: TasksViewModel
     let currentDateLocal: String
     let onOpenSheet: (OneAppShell.SheetRoute) -> Void
+    let onOpenReview: (String) -> Void
     let onRefreshTasksContext: () async -> Void
     let onRefreshAnalytics: () async -> Void
 
     @State private var isReordering = false
     @State private var isUpNextExpanded = false
+    @State private var isUpNextShowingAll = false
     @State private var isCompletedSectionExpanded = false
     @State private var visibleMilestoneCount = 0
     @State private var showsCompletionPayoff = false
+    @State private var busyItemIDs: Set<String> = []
     #if os(iOS)
     @State private var editMode: EditMode = .inactive
     #endif
@@ -1155,19 +2214,22 @@ private struct TodayTabView: View {
         activeItems.filter { !isNeedsAttention($0) }
     }
 
-    private var collapsedUpNextLimit: Int {
-        needsAttentionItems.isEmpty ? 4 : 3
+    private var upNextPreviewLimit: Int {
+        3
     }
 
-    private var visibleUpNextItems: [TodayItem] {
-        guard upNextItems.count > collapsedUpNextLimit, !isUpNextExpanded, !isReordering else {
+    private var showsCompactNeedsAttention: Bool {
+        needsAttentionItems.count > 2
+    }
+
+    private var visibleExpandedUpNextItems: [TodayItem] {
+        guard isUpNextExpanded else {
+            return []
+        }
+        guard !isUpNextShowingAll, upNextItems.count > upNextPreviewLimit else {
             return upNextItems
         }
-        return Array(upNextItems.prefix(collapsedUpNextLimit))
-    }
-
-    private var hiddenUpNextCount: Int {
-        max(upNextItems.count - visibleUpNextItems.count, 0)
+        return Array(upNextItems.prefix(upNextPreviewLimit))
     }
 
     private var completedItems: [TodayItem] {
@@ -1189,7 +2251,7 @@ private struct TodayTabView: View {
 
     private var focusMessage: String {
         if todayViewModel.totalCount == 0 {
-            return "Add a habit or task to shape today."
+            return "Add a habit, task, or note to shape today."
         }
         if todayViewModel.completionRatio == 1 {
             return "Everything planned for today is done. Let the rest stay quiet."
@@ -1231,13 +2293,19 @@ private struct TodayTabView: View {
                                         label: "\(Int(todayViewModel.completionRatio * 100))%"
                                     )
                                     if todayViewModel.completionRatio == 1 {
-                                        Label("Done", systemImage: "checkmark.circle.fill")
-                                            .font(OneType.caption.weight(.semibold))
-                                            .foregroundStyle(palette.highlight)
+                                        HStack(spacing: 6) {
+                                            OneIcon(key: .success, palette: palette, size: 14, tint: palette.highlight)
+                                            Text("Done")
+                                        }
+                                        .font(OneType.caption.weight(.semibold))
+                                        .foregroundStyle(palette.highlight)
                                     } else if !needsAttentionItems.isEmpty {
-                                        Label("Needs attention", systemImage: "exclamationmark.circle.fill")
-                                            .font(OneType.caption.weight(.semibold))
-                                            .foregroundStyle(palette.highlight)
+                                        HStack(spacing: 6) {
+                                            OneIcon(key: .warning, palette: palette, size: 14, tint: palette.highlight)
+                                            Text("Needs attention")
+                                        }
+                                        .font(OneType.caption.weight(.semibold))
+                                        .foregroundStyle(palette.highlight)
                                     }
                                 }
                             }
@@ -1247,9 +2315,12 @@ private struct TodayTabView: View {
                     if showsCompletionPayoff {
                         rowSurface {
                             OneSurfaceCard(palette: palette) {
-                                Label("Day complete", systemImage: "checkmark.seal.fill")
-                                    .font(OneType.sectionTitle)
-                                    .foregroundStyle(palette.highlight)
+                                HStack(spacing: 8) {
+                                    OneIcon(key: .completedDay, palette: palette, size: 18, tint: palette.highlight)
+                                    Text("Day complete")
+                                }
+                                .font(OneType.sectionTitle)
+                                .foregroundStyle(palette.highlight)
                                 Text("You finished what you planned today. That progress is ready for review when you return.")
                                     .font(OneType.secondary)
                                     .foregroundStyle(palette.subtext)
@@ -1272,12 +2343,13 @@ private struct TodayTabView: View {
                                     categoryIcon: categoryIcon(for: item.categoryId),
                                     isReordering: true,
                                     isHighlighted: item.id == todayViewModel.highlightedItemID,
+                                    isBusy: isBusy(item),
+                                    allowsSwipeCompletion: false,
+                                    allowsSwipeDelete: false,
                                     onToggle: {
-                                        Task {
-                                            await todayViewModel.toggle(item: item, dateLocal: dateLocal)
-                                            await onRefreshAnalytics()
-                                        }
-                                    }
+                                        toggleItem(item)
+                                    },
+                                    onDelete: nil
                                 ) {
                                     destination(for: item)
                                 }
@@ -1295,32 +2367,43 @@ private struct TodayTabView: View {
                             EmptyStateCard(
                                 palette: palette,
                                 title: "Nothing is planned for today",
-                                message: "Add a habit or task to build your day."
+                                message: "Add a habit, task, or note to start shaping the day."
                             )
                         }
                     } else {
                         if !needsAttentionItems.isEmpty {
-                            rowSurface {
-                                OneSectionHeading(palette: palette, title: "Needs attention", meta: "\(needsAttentionItems.count)")
-                            }
-
-                            ForEach(needsAttentionItems) { item in
+                            if showsCompactNeedsAttention {
+                                compactItemsSection(
+                                    title: "Needs attention",
+                                    meta: "\(needsAttentionItems.count)",
+                                    items: needsAttentionItems
+                                )
+                            } else {
                                 rowSurface {
-                                    TodayItemCard(
-                                        palette: palette,
-                                        item: item,
-                                        categoryName: categoryName(for: item.categoryId),
-                                        categoryIcon: categoryIcon(for: item.categoryId),
-                                        isReordering: false,
-                                        isHighlighted: item.id == todayViewModel.highlightedItemID,
-                                        onToggle: {
-                                            Task {
-                                                await todayViewModel.toggle(item: item, dateLocal: dateLocal)
-                                                await onRefreshAnalytics()
+                                    OneSectionHeading(palette: palette, title: "Needs attention", meta: "\(needsAttentionItems.count)")
+                                }
+
+                                ForEach(needsAttentionItems) { item in
+                                    rowSurface {
+                                        TodayItemCard(
+                                            palette: palette,
+                                            item: item,
+                                            categoryName: categoryName(for: item.categoryId),
+                                            categoryIcon: categoryIcon(for: item.categoryId),
+                                            isReordering: false,
+                                            isHighlighted: item.id == todayViewModel.highlightedItemID,
+                                            isBusy: isBusy(item),
+                                            allowsSwipeCompletion: allowsSwipeCompletion(for: item),
+                                            allowsSwipeDelete: allowsSwipeDelete(for: item),
+                                            onToggle: {
+                                                toggleItem(item)
+                                            },
+                                            onDelete: {
+                                                deleteItem(item)
                                             }
+                                        ) {
+                                            destination(for: item)
                                         }
-                                    ) {
-                                        destination(for: item)
                                     }
                                 }
                             }
@@ -1328,43 +2411,71 @@ private struct TodayTabView: View {
 
                         if !upNextItems.isEmpty {
                             rowSurface {
-                                HStack {
-                                    OneSectionHeading(
-                                        palette: palette,
-                                        title: "Up next",
-                                        meta: hiddenUpNextCount > 0 ? "\(hiddenUpNextCount) hidden" : "\(upNextItems.count)"
-                                    )
-                                    Spacer()
-                                    if hiddenUpNextCount > 0 {
-                                        Button(isUpNextExpanded ? "Show less" : "Show all") {
-                                            OneHaptics.shared.trigger(.selectionChanged)
-                                            withAnimation(OneMotion.animation(.expand)) {
-                                                isUpNextExpanded.toggle()
-                                            }
+                                OneSurfaceCard(palette: palette) {
+                                    Button {
+                                        toggleUpNextDisclosure()
+                                    } label: {
+                                        HStack(spacing: OneSpacing.sm) {
+                                            OneSectionHeading(
+                                                palette: palette,
+                                                title: "Up next",
+                                                meta: "\(upNextItems.count)"
+                                            )
+                                            Spacer()
+                                            Image(systemName: isUpNextExpanded ? "chevron.up" : "chevron.down")
+                                                .font(.system(size: 13, weight: .semibold))
+                                                .foregroundStyle(palette.subtext)
                                         }
-                                        .font(OneType.label)
-                                        .foregroundStyle(palette.accent)
                                     }
+                                    .onePressable(scale: 0.994)
                                 }
                             }
 
-                            ForEach(visibleUpNextItems) { item in
-                                rowSurface {
-                                    TodayItemCard(
-                                        palette: palette,
-                                        item: item,
-                                        categoryName: categoryName(for: item.categoryId),
-                                        categoryIcon: categoryIcon(for: item.categoryId),
-                                        isReordering: false,
-                                        isHighlighted: item.id == todayViewModel.highlightedItemID,
-                                        onToggle: {
-                                            Task {
-                                                await todayViewModel.toggle(item: item, dateLocal: dateLocal)
-                                                await onRefreshAnalytics()
+                            if isUpNextExpanded {
+                                ForEach(visibleExpandedUpNextItems) { item in
+                                    rowSurface {
+                                        CompactTodayActionRow(
+                                            palette: palette,
+                                            item: item,
+                                            categoryName: categoryName(for: item.categoryId),
+                                            isHighlighted: item.id == todayViewModel.highlightedItemID,
+                                            isBusy: isBusy(item),
+                                            allowsSwipeCompletion: allowsSwipeCompletion(for: item),
+                                            allowsSwipeDelete: allowsSwipeDelete(for: item),
+                                            onToggle: {
+                                                toggleItem(item)
+                                            },
+                                            onDelete: {
+                                                deleteItem(item)
                                             }
+                                        ) {
+                                            destination(for: item)
                                         }
-                                    ) {
-                                        destination(for: item)
+                                    }
+                                }
+
+                                if upNextItems.count > upNextPreviewLimit {
+                                    rowSurface {
+                                        OneSurfaceCard(palette: palette) {
+                                            Button {
+                                                toggleUpNextShowAll()
+                                            } label: {
+                                                HStack(spacing: OneSpacing.sm) {
+                                                    Text(isUpNextShowingAll ? "Show less" : "Show all")
+                                                        .font(OneType.label)
+                                                        .foregroundStyle(palette.accent)
+                                                    Spacer()
+                                                    Text(
+                                                        isUpNextShowingAll
+                                                        ? "Show preview"
+                                                        : "\(upNextItems.count - visibleExpandedUpNextItems.count) more"
+                                                    )
+                                                    .font(OneType.caption)
+                                                    .foregroundStyle(palette.subtext)
+                                                }
+                                            }
+                                            .onePressable(scale: 0.99)
+                                        }
                                     }
                                 }
                             }
@@ -1404,12 +2515,13 @@ private struct TodayTabView: View {
                                                 categoryIcon: categoryIcon(for: item.categoryId),
                                                 isReordering: false,
                                                 isHighlighted: item.id == todayViewModel.highlightedItemID,
+                                                isBusy: isBusy(item),
+                                                allowsSwipeCompletion: false,
+                                                allowsSwipeDelete: false,
                                                 onToggle: {
-                                                    Task {
-                                                        await todayViewModel.toggle(item: item, dateLocal: dateLocal)
-                                                        await onRefreshAnalytics()
-                                                    }
-                                                }
+                                                    toggleItem(item)
+                                                },
+                                                onDelete: nil
                                             ) {
                                                 destination(for: item)
                                             }
@@ -1437,34 +2549,19 @@ private struct TodayTabView: View {
         .oneNavigationBarDisplayMode(.large)
         .toolbar {
             ToolbarItem(placement: .oneNavigationLeading) {
-                Button("Notes") {
-                    OneHaptics.shared.trigger(.sheetPresented)
-                    onOpenSheet(.notes(anchorDate: dateLocal, periodType: .daily))
+                Button("Review") {
+                    onOpenReview(dateLocal)
                 }
             }
-            ToolbarItemGroup(placement: .oneNavigationTrailing) {
+            ToolbarItem(placement: .oneNavigationTrailing) {
                 Button(isReordering ? "Done" : "Reorder") {
                     OneHaptics.shared.trigger(isReordering ? .reorderDrop : .reorderPickup)
                     withAnimation(OneMotion.animation(.expand)) {
                         isReordering.toggle()
-                        isUpNextExpanded = isReordering
                         #if os(iOS)
                         editMode = isReordering ? .active : .inactive
                         #endif
                     }
-                }
-
-                Menu {
-                    Button("Add task") {
-                        OneHaptics.shared.trigger(.sheetPresented)
-                        onOpenSheet(.addTodo)
-                    }
-                    Button("Add habit") {
-                        OneHaptics.shared.trigger(.sheetPresented)
-                        onOpenSheet(.addHabit)
-                    }
-                } label: {
-                    Image(systemName: "plus")
                 }
             }
         }
@@ -1486,6 +2583,14 @@ private struct TodayTabView: View {
                 withAnimation(OneMotion.animation(.dismiss)) {
                     showsCompletionPayoff = false
                 }
+            }
+        }
+        .onChange(of: upNextItems.count) { _, newValue in
+            if newValue == 0 {
+                isUpNextExpanded = false
+            }
+            if newValue <= upNextPreviewLimit {
+                isUpNextShowingAll = false
             }
         }
         #if os(iOS)
@@ -1530,9 +2635,111 @@ private struct TodayTabView: View {
         tasksViewModel.categories.first(where: { $0.id == categoryId })?.name ?? "Category"
     }
 
-    private func categoryIcon(for categoryId: String) -> String {
+    private func categoryIcon(for categoryId: String) -> OneIconKey {
         let category = tasksViewModel.categories.first(where: { $0.id == categoryId })
         return actionQueueCategoryIcon(name: category?.name ?? "Category", storedIcon: category?.icon)
+    }
+
+    private func isBusy(_ item: TodayItem) -> Bool {
+        busyItemIDs.contains(item.id)
+    }
+
+    private func allowsSwipeCompletion(for item: TodayItem) -> Bool {
+        !isReordering && !item.completed
+    }
+
+    private func allowsSwipeDelete(for item: TodayItem) -> Bool {
+        !isReordering && !item.completed && item.itemType == .todo
+    }
+
+    private func toggleUpNextDisclosure() {
+        OneHaptics.shared.trigger(.selectionChanged)
+        withAnimation(OneMotion.animation(.expand)) {
+            isUpNextExpanded.toggle()
+            if !isUpNextExpanded {
+                isUpNextShowingAll = false
+            }
+        }
+    }
+
+    private func toggleUpNextShowAll() {
+        OneHaptics.shared.trigger(.selectionChanged)
+        withAnimation(OneMotion.animation(.expand)) {
+            isUpNextShowingAll.toggle()
+        }
+    }
+
+    private func toggleItem(_ item: TodayItem) {
+        performItemAction(for: item) {
+            await todayViewModel.toggle(item: item, dateLocal: dateLocal)
+            await onRefreshAnalytics()
+        }
+    }
+
+    private func deleteItem(_ item: TodayItem) {
+        guard item.itemType == .todo else {
+            return
+        }
+        performItemAction(for: item) {
+            guard await tasksViewModel.deleteTodo(id: item.itemId) else {
+                return
+            }
+            OneSyncFeedbackCenter.shared.showSynced(
+                title: "Task deleted",
+                message: "\(item.title) was removed from Today."
+            )
+            await onRefreshTasksContext()
+        }
+    }
+
+    private func performItemAction(for item: TodayItem, action: @escaping () async -> Void) {
+        guard !busyItemIDs.contains(item.id) else {
+            return
+        }
+        busyItemIDs.insert(item.id)
+        Task { @MainActor in
+            defer { busyItemIDs.remove(item.id) }
+            await action()
+        }
+    }
+
+    @ViewBuilder
+    private func compactItemsSection(
+        title: String,
+        meta: String,
+        items: [TodayItem]
+    ) -> some View {
+        rowSurface {
+            OneSurfaceCard(palette: palette) {
+                OneSectionHeading(
+                    palette: palette,
+                    title: title,
+                    meta: meta
+                )
+            }
+        }
+
+        ForEach(items) { item in
+            rowSurface {
+                CompactTodayActionRow(
+                    palette: palette,
+                    item: item,
+                    categoryName: categoryName(for: item.categoryId),
+                    isHighlighted: item.id == todayViewModel.highlightedItemID,
+                    isBusy: isBusy(item),
+                    allowsSwipeCompletion: allowsSwipeCompletion(for: item),
+                    allowsSwipeDelete: allowsSwipeDelete(for: item),
+                    onToggle: {
+                        toggleItem(item)
+                    },
+                    onDelete: {
+                        deleteItem(item)
+                    }
+                ) {
+                    destination(for: item)
+                }
+            }
+        }
     }
 
     @ViewBuilder
@@ -1544,212 +2751,13 @@ private struct TodayTabView: View {
     }
 }
 
-private struct AnalyticsTabView: View {
-    @ObservedObject var viewModel: AnalyticsViewModel
-    let currentDateLocal: String
-    let onSelectPeriod: (PeriodType) async -> Void
-    let onOpenNotes: (String) -> Void
-    @Environment(\.colorScheme) private var colorScheme
-
-    private var palette: OneTheme.Palette {
-        OneTheme.palette(for: colorScheme)
-    }
-
-    private let periodOptions: [PeriodType] = [.weekly, .monthly, .yearly]
-
-    private var primarySummary: PeriodSummary? {
-        viewModel.summary ?? viewModel.weekly
-    }
-
-    private var headlineInsight: String {
-        guard let summary = primarySummary else {
-            return "Your progress will appear here once you complete habits or tasks."
-        }
-        if summary.completionRate >= 0.8 {
-            return "You are keeping strong momentum this \(periodTitle(summary.periodType).lowercased())."
-        }
-        if summary.activeDays == 0 {
-            return "No activity is recorded for this \(periodTitle(summary.periodType).lowercased()) yet."
-        }
-        return "You completed \(summary.completedItems) of \(summary.expectedItems) planned items."
-    }
-
-    var body: some View {
-        NavigationStack {
-            OneScrollScreen(
-                palette: palette,
-                bottomPadding: OneDockLayout.tabScreenBottomPadding
-            ) {
-                OneSurfaceCard(palette: palette) {
-                    OneSegmentedControl(
-                        palette: palette,
-                        options: periodOptions,
-                        selection: viewModel.selectedPeriod,
-                        title: { periodTitle($0) }
-                    ) { selection in
-                        Task {
-                            await onSelectPeriod(selection)
-                        }
-                    }
-                }
-
-                if let summary = primarySummary {
-                    OneGlassCard(palette: palette) {
-                        Text(periodTitle(summary.periodType) + " insight")
-                            .font(OneType.label)
-                            .foregroundStyle(palette.subtext)
-                        Text(headlineInsight)
-                            .font(OneType.title)
-                            .foregroundStyle(palette.text)
-                            .fixedSize(horizontal: false, vertical: true)
-                        HStack(spacing: 10) {
-                            SummaryMetricTile(palette: palette, title: "Completed", value: "\(summary.completedItems)")
-                            SummaryMetricTile(palette: palette, title: "Planned", value: "\(summary.expectedItems)")
-                            SummaryMetricTile(palette: palette, title: "Completion rate", value: "\(Int(summary.completionRate * 100))%")
-                        }
-                        HStack(spacing: 10) {
-                            SummaryMetricTile(palette: palette, title: "Consistency", value: "\(Int(summary.consistencyScore * 100))%")
-                            SummaryMetricTile(palette: palette, title: "Active Days", value: "\(summary.activeDays)")
-                            SummaryMetricTile(palette: palette, title: "Range", value: summary.periodEnd)
-                        }
-                    }
-                    .redacted(reason: viewModel.isTransitioning ? .placeholder : [])
-                }
-
-                OneSurfaceCard(palette: palette) {
-                    OneSectionHeading(
-                        palette: palette,
-                        title: "Progress",
-                        meta: viewModel.selectedPeriod == .monthly
-                            ? (viewModel.selectedMonthWeekDetailLabel ?? periodTitle(viewModel.selectedPeriod))
-                            : periodTitle(viewModel.selectedPeriod)
-                    )
-                    if viewModel.chartSeries.values.isEmpty {
-                        Text("Complete a few habits or tasks to build this view.")
-                            .font(OneType.secondary)
-                            .foregroundStyle(palette.subtext)
-                    } else {
-                        OneActivityLane(
-                            palette: palette,
-                            values: viewModel.chartSeries.values,
-                            labels: viewModel.chartSeries.labels,
-                            highlightIndex: chartHighlightIndex,
-                            onSelectIndex: viewModel.selectedPeriod == .monthly ? { index in
-                                viewModel.selectMonthWeek(index + 1)
-                            } : nil
-                        )
-                    }
-                }
-                .redacted(reason: viewModel.isTransitioning ? .placeholder : [])
-
-                OneSurfaceCard(palette: palette) {
-                    OneSectionHeading(
-                        palette: palette,
-                        title: "History",
-                        meta: contributionMeta
-                    )
-                    if viewModel.dailySummaries.isEmpty {
-                        Text("Your history will appear here.")
-                            .font(OneType.secondary)
-                            .foregroundStyle(palette.subtext)
-                    } else {
-                        if viewModel.selectedPeriod == .yearly {
-                            AnalyticsYearContributionView(
-                                palette: palette,
-                                sections: viewModel.contributionSections,
-                                onSelectDate: onOpenNotes
-                            )
-                        } else {
-                            AnalyticsContributionGrid(
-                                palette: palette,
-                                summaries: viewModel.dailySummaries,
-                                onSelectDate: onOpenNotes
-                            )
-                        }
-                    }
-                }
-                .redacted(reason: viewModel.isTransitioning ? .placeholder : [])
-
-                if let sentimentOverview = viewModel.sentimentOverview {
-                    OneSurfaceCard(palette: palette) {
-                        OneSectionHeading(palette: palette, title: "Notes mood", meta: sentimentOverview.dominant?.title ?? "No dominant pattern")
-                        AnalyticsSentimentOverviewView(
-                            palette: palette,
-                            periodType: viewModel.selectedPeriod,
-                            overview: sentimentOverview,
-                            highlightedDates: viewModel.selectedPeriod == .monthly ? Set(viewModel.dailySummaries.map(\.dateLocal)) : [],
-                            onOpenDate: onOpenNotes
-                        )
-                    }
-                    .redacted(reason: viewModel.isTransitioning ? .placeholder : [])
-                }
-
-                if let message = viewModel.errorMessage {
-                    InlineStatusCard(message: message, kind: .danger, palette: palette)
-                }
-            }
-            .navigationTitle("Analytics")
-            .oneNavigationBarDisplayMode(.large)
-            .toolbar {
-                ToolbarItem(placement: .oneNavigationTrailing) {
-                    Menu {
-                        ForEach(AnalyticsActivityFilter.allCases, id: \.self) { filter in
-                            Button(filter.title) {
-                                viewModel.selectActivityFilter(filter)
-                            }
-                        }
-                    } label: {
-                        Label(viewModel.selectedActivityFilter.title, systemImage: "line.3.horizontal.decrease.circle")
-                    }
-                }
-            }
-        }
-    }
-
-    private var chartHighlightIndex: Int? {
-        switch viewModel.selectedPeriod {
-        case .weekly:
-            return viewModel.dailySummaries.lastIndex(where: { $0.dateLocal == currentDateLocal })
-        case .monthly:
-            guard let selectedMonthWeek = viewModel.selectedMonthWeek else {
-                return nil
-            }
-            return max(0, selectedMonthWeek - 1)
-        case .yearly:
-            return viewModel.chartSeries.labels.indices.last
-        case .daily:
-            return nil
-        }
-    }
-
-    private var contributionMeta: String {
-        switch viewModel.selectedPeriod {
-        case .weekly:
-            return "Full selected week"
-        case .monthly:
-            return viewModel.selectedMonthWeekDetailLabel ?? "Selected week"
-        case .yearly:
-            return "Full year"
-        case .daily:
-            return "Selected day"
-        }
-    }
-
-    private func periodTitle(_ period: PeriodType) -> String {
-        switch period {
-        case .weekly:
-            return "Week"
-        case .monthly:
-            return "Month"
-        case .yearly:
-            return "Year"
-        case .daily:
-            return "Day"
-        }
-    }
-}
-
 private struct NotesSheetView: View {
+    private struct ComposerRoute: Identifiable {
+        let dateLocal: String
+
+        var id: String { dateLocal }
+    }
+
     @ObservedObject var viewModel: NotesViewModel
     let initialAnchorDate: String
     let initialPeriod: PeriodType
@@ -1759,6 +2767,7 @@ private struct NotesSheetView: View {
     let onRefreshReflections: () async -> Void
 
     @State private var pendingDeleteNote: ReflectionNote?
+    @State private var composerRoute: ComposerRoute?
     @Environment(\.colorScheme) private var colorScheme
 
     private let periodOptions: [PeriodType] = [.daily, .weekly, .monthly, .yearly]
@@ -1767,12 +2776,95 @@ private struct NotesSheetView: View {
         OneTheme.palette(for: colorScheme)
     }
 
+    private var summaryNoteCount: String {
+        "\(viewModel.sentimentSummary?.noteCount ?? 0)"
+    }
+
+    private var summaryActiveDays: String {
+        "\(viewModel.sentimentSummary?.activeDays ?? 0)"
+    }
+
+    private var dominantSummaryTitle: String {
+        viewModel.sentimentSummary?.dominant?.title ?? "None"
+    }
+
+    private var selectedDayEntryTitle: String {
+        let count = viewModel.selectedDayNotes.count
+        if count == 0 {
+            return "No notes on \(viewModel.selectedDayTitle)"
+        }
+        if count == 1 {
+            return "1 note on \(viewModel.selectedDayTitle)"
+        }
+        return "\(count) notes on \(viewModel.selectedDayTitle)"
+    }
+
     var body: some View {
         NavigationStack {
             OneScrollScreen(
                 palette: palette,
                 bottomPadding: 36
             ) {
+                OneGlassCard(palette: palette) {
+                    OneSectionHeading(
+                        palette: palette,
+                        title: "Notes overview",
+                        meta: notesPeriodTitle(viewModel.selectedPeriod)
+                    )
+                    Text("Review note volume, mood, and history without opening the capture flow.")
+                        .font(OneType.secondary)
+                        .foregroundStyle(palette.subtext)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 10) {
+                        SummaryMetricTile(palette: palette, title: "Notes", value: summaryNoteCount)
+                        SummaryMetricTile(palette: palette, title: "Active Days", value: summaryActiveDays)
+                        SummaryMetricTile(palette: palette, title: "Dominant", value: dominantSummaryTitle)
+                    }
+                    if let summary = viewModel.sentimentSummary, !summary.distribution.isEmpty {
+                        FlowLayout(spacing: 8) {
+                            ForEach(summary.distribution) { item in
+                                OneChip(
+                                    palette: palette,
+                                    title: "\(item.sentiment.title) \(item.count)",
+                                    kind: item.sentiment.chipKind
+                                )
+                            }
+                        }
+                    }
+                    HStack(alignment: .center, spacing: 12) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(selectedDayEntryTitle)
+                                .font(OneType.label)
+                                .foregroundStyle(palette.text)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text("Use quick add when you want a focused note capture instead of opening history.")
+                                .font(OneType.caption)
+                                .foregroundStyle(palette.subtext)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 8)
+                        Button("New Note") {
+                            OneHaptics.shared.trigger(.sheetPresented)
+                            composerRoute = ComposerRoute(dateLocal: viewModel.selectedDateLocal)
+                        }
+                        .font(OneType.caption.weight(.semibold))
+                        .foregroundStyle(palette.accent)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(palette.accentSoft)
+                        )
+                        .overlay(
+                            Capsule(style: .continuous)
+                                .stroke(palette.border, lineWidth: 1)
+                        )
+                        .buttonStyle(.plain)
+                        .onePressable(scale: 0.97)
+                    }
+                }
+                .oneEntranceReveal(index: 0)
+
                 OneGlassCard(palette: palette) {
                     OneSegmentedControl(
                         palette: palette,
@@ -1784,66 +2876,6 @@ private struct NotesSheetView: View {
                     }
                 }
                 .oneEntranceReveal(index: 1)
-
-                if let summary = viewModel.sentimentSummary {
-                    OneSurfaceCard(palette: palette) {
-                        OneSectionHeading(
-                            palette: palette,
-                            title: "Period summary",
-                            meta: summary.dominant?.title ?? "No clear pattern"
-                        )
-                        HStack(spacing: 10) {
-                            SummaryMetricTile(palette: palette, title: "Notes", value: "\(summary.noteCount)")
-                            SummaryMetricTile(palette: palette, title: "Active Days", value: "\(summary.activeDays)")
-                            SummaryMetricTile(
-                                palette: palette,
-                                title: "Dominant",
-                                value: summary.dominant?.title ?? "-"
-                            )
-                        }
-                        if !summary.distribution.isEmpty {
-                            FlowLayout(spacing: 8) {
-                                ForEach(summary.distribution) { item in
-                                    OneChip(
-                                        palette: palette,
-                                        title: "\(item.sentiment.title) \(item.count)",
-                                        kind: item.sentiment.chipKind
-                                    )
-                                }
-                            }
-                        }
-                    }
-                    .oneEntranceReveal(index: 2)
-                }
-
-                OneSurfaceCard(palette: palette) {
-                    OneSectionHeading(
-                        palette: palette,
-                        title: "Entries",
-                        meta: viewModel.selectedDayTitle
-                    )
-
-                    if viewModel.selectedDayNotes.isEmpty {
-                        EmptyStateCard(
-                            palette: palette,
-                            title: "No notes for this date",
-                            message: "Choose another day or save a note to start building history."
-                        )
-                    } else {
-                        VStack(spacing: 10) {
-                            ForEach(viewModel.selectedDayNotes) { note in
-                                QuickNoteRow(
-                                    palette: palette,
-                                    note: note,
-                                    onDelete: {
-                                        pendingDeleteNote = note
-                                    }
-                                )
-                            }
-                        }
-                    }
-                }
-                .oneEntranceReveal(index: 3)
 
                 OneSurfaceCard(palette: palette) {
                     OneSectionHeading(
@@ -1884,7 +2916,7 @@ private struct NotesSheetView: View {
                         .onePressable(scale: 0.94)
                     }
                 }
-                .oneEntranceReveal(index: 4)
+                .oneEntranceReveal(index: 2)
 
                 OneSurfaceCard(palette: palette) {
                     switch viewModel.selectedPeriod {
@@ -1933,11 +2965,40 @@ private struct NotesSheetView: View {
                         }
                     }
                 }
-                .oneEntranceReveal(index: 5)
+                .oneEntranceReveal(index: 3)
+
+                OneSurfaceCard(palette: palette) {
+                    OneSectionHeading(
+                        palette: palette,
+                        title: "History",
+                        meta: viewModel.selectedDayTitle
+                    )
+
+                    if viewModel.selectedDayNotes.isEmpty {
+                        EmptyStateCard(
+                            palette: palette,
+                            title: "No notes for this date",
+                            message: "Pick another day to review history, or use New Note for a focused capture flow."
+                        )
+                    } else {
+                        VStack(spacing: 10) {
+                            ForEach(viewModel.selectedDayNotes) { note in
+                                QuickNoteRow(
+                                    palette: palette,
+                                    note: note,
+                                    onDelete: {
+                                        pendingDeleteNote = note
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+                .oneEntranceReveal(index: 4)
 
                 if let message = viewModel.errorMessage {
                     InlineStatusCard(message: message, kind: .danger, palette: palette)
-                        .oneEntranceReveal(index: 6)
+                        .oneEntranceReveal(index: 5)
                 }
             }
             .navigationTitle("Notes")
@@ -1988,6 +3049,17 @@ private struct NotesSheetView: View {
                 }
             } message: {
                 Text("This removes the note and its sentiment from your history.")
+            }
+            .sheet(item: $composerRoute) { route in
+                NoteComposerSheetView(
+                    viewModel: viewModel,
+                    anchorDate: route.dateLocal,
+                    onDismiss: {
+                        composerRoute = nil
+                    },
+                    onRefreshAnalytics: onRefreshAnalytics,
+                    onRefreshReflections: onRefreshReflections
+                )
             }
         }
     }
@@ -2044,6 +3116,117 @@ private struct NotesFocusedDayCard: View {
             }
             .onePressable(scale: 0.985)
         }
+    }
+}
+
+private struct NoteComposerSheetView: View {
+    @ObservedObject var viewModel: NotesViewModel
+    let anchorDate: String
+    let onDismiss: () -> Void
+    let onRefreshAnalytics: () async -> Void
+    let onRefreshReflections: () async -> Void
+
+    @State private var draftContent = ""
+    @State private var draftSentiment: ReflectionSentiment? = .focused
+    @State private var isSaving = false
+    @State private var saveErrorMessage: String?
+    @FocusState private var isComposerFocused: Bool
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var palette: OneTheme.Palette {
+        OneTheme.palette(for: colorScheme)
+    }
+
+    var body: some View {
+        NavigationStack {
+            OneScrollScreen(palette: palette, bottomPadding: 36) {
+                OneGlassCard(palette: palette) {
+                    OneSectionHeading(
+                        palette: palette,
+                        title: "New note",
+                        meta: OneDate.longDate(from: anchorDate)
+                    )
+                    Text("Capture what matters without opening your note history.")
+                        .font(OneType.secondary)
+                        .foregroundStyle(palette.subtext)
+                        .fixedSize(horizontal: false, vertical: true)
+                    SentimentPickerRow(
+                        palette: palette,
+                        selectedSentiment: $draftSentiment
+                    )
+                    OneTextEditorField(
+                        title: "Reflection",
+                        text: $draftContent,
+                        placeholder: "What happened, what mattered, or what should not be lost?",
+                        isFocused: $isComposerFocused
+                    )
+                    Text("Saves to \(OneDate.longDate(from: anchorDate))")
+                        .font(OneType.caption)
+                        .foregroundStyle(palette.subtext)
+                    OneActionButton(
+                        palette: palette,
+                        title: isSaving ? "Saving..." : "Save Note",
+                        style: .primary
+                    ) {
+                        guard !isSaving else {
+                            return
+                        }
+                        Task {
+                            await save()
+                        }
+                    }
+                    .disabled(
+                        isSaving ||
+                        draftSentiment == nil ||
+                        draftContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    )
+                }
+
+                if let saveErrorMessage {
+                    InlineStatusCard(message: saveErrorMessage, kind: .danger, palette: palette)
+                }
+            }
+            .navigationTitle("Add Note")
+            .oneNavigationBarDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .oneNavigationLeading) {
+                    Button("Cancel") {
+                        OneHaptics.shared.trigger(.sheetDismissed)
+                        onDismiss()
+                    }
+                }
+            }
+            .task {
+                guard !isComposerFocused else {
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(180))
+                isComposerFocused = true
+            }
+        }
+    }
+
+    private func save() async {
+        guard let draftSentiment else {
+            return
+        }
+        isSaving = true
+        saveErrorMessage = nil
+        defer { isSaving = false }
+
+        guard await viewModel.createNote(
+            content: draftContent,
+            sentiment: draftSentiment,
+            for: anchorDate
+        ) != nil else {
+            saveErrorMessage = viewModel.errorMessage ?? "Could not save note."
+            return
+        }
+
+        await onRefreshReflections()
+        await onRefreshAnalytics()
+        try? await Task.sleep(for: .milliseconds(220))
+        onDismiss()
     }
 }
 
@@ -2214,7 +3397,7 @@ private struct ProfileTabView: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("Account") {
+                Section("Profile") {
                     TextField("Your name", text: $displayName)
                     LabeledContent("Time zone", value: deviceTimezoneID)
                     Button("Save name") {
@@ -2241,26 +3424,38 @@ private struct ProfileTabView: View {
                     }
                 }
 
-                Section("Notifications") {
+                Section("Device Status") {
                     Button {
                         OneHaptics.shared.trigger(.sheetPresented)
                         onOpenSheet(.notifications)
                     } label: {
-                        LabeledContent("Open notifications", value: notificationMeta)
+                        OneSettingsRow(
+                            palette: palette,
+                            iconKey: .notifications,
+                            title: "Notifications",
+                            meta: "Permission, schedules, quiet hours, and reminder types.",
+                            tail: notificationMeta
+                        )
                     }
-                }
+                    .buttonStyle(.plain)
 
-                Section("Coach") {
                     Button {
                         OneHaptics.shared.trigger(.sheetPresented)
                         onOpenSheet(.coach)
                     } label: {
-                        LabeledContent("Open coach", value: coachViewModel.cards.first?.title ?? "Daily guidance that stays secondary.")
+                        OneSettingsRow(
+                            palette: palette,
+                            iconKey: .coach,
+                            title: "Coach",
+                            meta: coachViewModel.cards.first?.title ?? "Daily guidance that stays secondary.",
+                            tail: nil
+                        )
                     }
+                    .buttonStyle(.plain)
                 }
 
                 Section("About") {
-                    Text("ONE is built for calm daily execution on iPhone. Data stays on this device unless you choose an account.")
+                    Text("One is built for calm daily execution on iPhone. Data stays on this device unless you choose an account.")
                 }
 
                 Section {
@@ -2270,6 +3465,8 @@ private struct ProfileTabView: View {
                             await authViewModel.logout()
                         }
                     }
+                } header: {
+                    Text("Session")
                 } footer: {
                     Text("Signing out ends the current session on this device.")
                 }
@@ -2285,6 +3482,7 @@ private struct ProfileTabView: View {
             .background(OneScreenBackground(palette: palette))
             .navigationTitle("Settings")
             .oneNavigationBarDisplayMode(.large)
+            .oneKeyboardDismissible()
             .onAppear {
                 hydrateFromLoadedData()
             }
@@ -2308,10 +3506,12 @@ private struct ProfileTabView: View {
 
     private var notificationMeta: String {
         guard let status = profileViewModel.notificationStatus else {
-            return "Schedule reminders, quiet hours, and prompts"
+            return "Set up"
         }
-        let permission = status.permissionGranted ? "granted" : "off"
-        return "\(status.scheduledCount) scheduled · permission \(permission)"
+        guard status.permissionGranted else {
+            return "Permission off"
+        }
+        return "\(status.scheduledCount) scheduled"
     }
 
 }
@@ -2389,6 +3589,7 @@ private struct HabitFormSheet: View {
             .background(OneScreenBackground(palette: palette))
             .navigationTitle("Add Habit")
             .oneNavigationBarDisplayMode(.inline)
+            .oneKeyboardDismissible()
             .toolbar {
                 ToolbarItem(placement: .oneNavigationLeading) {
                     Button("Cancel") {
@@ -2494,6 +3695,7 @@ private struct TodoFormSheet: View {
             .background(OneScreenBackground(palette: palette))
             .navigationTitle("Add Task")
             .oneNavigationBarDisplayMode(.inline)
+            .oneKeyboardDismissible()
             .toolbar {
                 ToolbarItem(placement: .oneNavigationLeading) {
                     Button("Cancel") {
@@ -2632,6 +3834,7 @@ private struct HabitDetailView: View {
         .background(OneScreenBackground(palette: palette))
         .navigationTitle(habit?.title ?? "Habit")
         .oneNavigationBarDisplayMode(.inline)
+        .oneKeyboardDismissible()
         .toolbar {
             ToolbarItem(placement: .oneNavigationTrailing) {
                 Button("Save") {
@@ -2787,6 +3990,7 @@ private struct TodoDetailView: View {
         .background(OneScreenBackground(palette: palette))
         .navigationTitle(todo?.title ?? "Task")
         .oneNavigationBarDisplayMode(.inline)
+        .oneKeyboardDismissible()
         .toolbar {
             ToolbarItem(placement: .oneNavigationTrailing) {
                 Button("Save") {
@@ -2873,6 +4077,7 @@ private struct NotificationPreferencesView: View {
     @State private var quietHoursStartSelection = OneTimeValueFormatter.date(from: "22:00:00") ?? Date()
     @State private var quietHoursEndSelection = OneTimeValueFormatter.date(from: "07:00:00") ?? Date()
     @State private var coachEnabled = true
+    @State private var isSaving = false
     @Environment(\.colorScheme) private var colorScheme
 
     private var palette: OneTheme.Palette {
@@ -2882,23 +4087,6 @@ private struct NotificationPreferencesView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Reminder types") {
-                    Toggle("Habit reminders", isOn: $habitReminders)
-                    Toggle("Task reminders", isOn: $todoReminders)
-                    Toggle("Notes prompts", isOn: $reflectionPrompts)
-                    Toggle("Weekly summary", isOn: $weeklySummary)
-                    Toggle("Coach prompts", isOn: $coachEnabled)
-                }
-
-                Section {
-                    DatePicker("Starts", selection: $quietHoursStartSelection, displayedComponents: [.hourAndMinute])
-                    DatePicker("Ends", selection: $quietHoursEndSelection, displayedComponents: [.hourAndMinute])
-                } header: {
-                    Text("Quiet hours")
-                } footer: {
-                    Text("Quiet hours silence reminders between the times you set here.")
-                }
-
                 if let status = profileViewModel.notificationStatus {
                     Section {
                         LabeledContent("Permission", value: status.permissionGranted ? "On" : "Off")
@@ -2930,6 +4118,23 @@ private struct NotificationPreferencesView: View {
                         )
                     }
                 }
+
+                Section("Reminder types") {
+                    Toggle("Habit reminders", isOn: $habitReminders)
+                    Toggle("Task reminders", isOn: $todoReminders)
+                    Toggle("Notes prompts", isOn: $reflectionPrompts)
+                    Toggle("Weekly summary", isOn: $weeklySummary)
+                    Toggle("Coach prompts", isOn: $coachEnabled)
+                }
+
+                Section {
+                    DatePicker("Starts", selection: $quietHoursStartSelection, displayedComponents: [.hourAndMinute])
+                    DatePicker("Ends", selection: $quietHoursEndSelection, displayedComponents: [.hourAndMinute])
+                } header: {
+                    Text("Quiet hours")
+                } footer: {
+                    Text("Quiet hours silence reminders between the times you set here.")
+                }
             }
             .scrollContentBackground(.hidden)
             .background(OneScreenBackground(palette: palette))
@@ -2944,9 +4149,15 @@ private struct NotificationPreferencesView: View {
                     }
                 }
                 ToolbarItem(placement: .oneNavigationTrailing) {
-                    Button("Save") {
+                    Button(isSaving ? "Saving..." : "Save") {
                         Task {
-                            await profileViewModel.savePreferences(
+                            guard !isSaving else {
+                                return
+                            }
+                            isSaving = true
+                            defer { isSaving = false }
+
+                            guard await profileViewModel.savePreferences(
                                 input: UserPreferencesUpdateInput(
                                     quietHoursStart: OneTimeValueFormatter.string(from: quietHoursStartSelection),
                                     quietHoursEnd: OneTimeValueFormatter.string(from: quietHoursEndSelection),
@@ -2958,9 +4169,17 @@ private struct NotificationPreferencesView: View {
                                     ],
                                     coachEnabled: coachEnabled
                                 )
-                            )
+                            ) else {
+                                return
+                            }
+
+                            try? await Task.sleep(for: .milliseconds(260))
+                            OneHaptics.shared.trigger(.sheetDismissed)
+                            onClose()
+                            dismiss()
                         }
                     }
+                    .disabled(isSaving)
                     .fontWeight(.semibold)
                 }
             }
@@ -3003,6 +4222,10 @@ private struct NotificationPreferencesView: View {
 
 private struct CoachSheetView: View {
     @ObservedObject var viewModel: CoachViewModel
+    @ObservedObject var todayViewModel: TodayViewModel
+    @ObservedObject var analyticsViewModel: AnalyticsViewModel
+    @ObservedObject var reflectionsViewModel: ReflectionsViewModel
+    let currentDateLocal: String
     let onClose: () -> Void
     @Environment(\.colorScheme) private var colorScheme
 
@@ -3010,52 +4233,162 @@ private struct CoachSheetView: View {
         OneTheme.palette(for: colorScheme)
     }
 
+    private var remainingItems: [TodayItem] {
+        todayViewModel.items.filter { !$0.completed }
+    }
+
+    private var focusItem: TodayItem? {
+        remainingItems.first(where: { $0.priorityTier == .urgent || $0.priorityTier == .high }) ?? remainingItems.first
+    }
+
+    private var todayNotes: [ReflectionNote] {
+        reflectionsViewModel.notes.filter { $0.periodStart == currentDateLocal }
+    }
+
+    private var recentNotes: [ReflectionNote] {
+        Array(reflectionsViewModel.notes.prefix(6))
+    }
+
+    private var reflectionSignal: [ReflectionNote] {
+        todayNotes.isEmpty ? recentNotes : todayNotes
+    }
+
+    private var reflectionSummary: ReflectionSentimentVoteSummary {
+        reflectionSentimentSummary(for: reflectionSignal)
+    }
+
+    private var prioritizedCards: [CoachCard] {
+        let dateSeed = currentDateLocal.unicodeScalars.reduce(into: 0) { partial, scalar in
+            partial += Int(scalar.value)
+        }
+        return Array(
+            viewModel.cards.enumerated().sorted { lhs, rhs in
+                coachCardScore(lhs.element, offset: lhs.offset, seed: dateSeed) >
+                coachCardScore(rhs.element, offset: rhs.offset, seed: dateSeed)
+            }
+        )
+        .map(\.element)
+    }
+
+    private var featuredCard: CoachCard? {
+        prioritizedCards.first
+    }
+
+    private var supportingCards: [CoachCard] {
+        Array(prioritizedCards.dropFirst().prefix(2))
+    }
+
     var body: some View {
         NavigationStack {
             OneScrollScreen(palette: palette, bottomPadding: 36) {
-                if viewModel.cards.isEmpty {
-                    EmptyStateCard(
-                        palette: palette,
-                        title: "No coach content yet",
-                        message: "Guidance will appear here when it is available."
-                    )
-                    .oneEntranceReveal(index: 1)
-                } else {
-                    if let featuredCard = viewModel.cards.first {
-                        OneGlassCard(palette: palette) {
-                            Text("Today")
-                                .font(OneType.label)
-                                .foregroundStyle(palette.highlight)
-                            Text(featuredCard.title)
-                                .font(OneType.title)
-                                .foregroundStyle(palette.text)
-                            Text(featuredCard.body)
-                                .font(OneType.body)
-                                .foregroundStyle(palette.subtext)
-                                .fixedSize(horizontal: false, vertical: true)
-                            CoachVerseBlock(palette: palette, card: featuredCard)
+                OneGlassCard(palette: palette) {
+                    Text("Today")
+                        .font(OneType.label)
+                        .foregroundStyle(palette.highlight)
+                    Text(featuredCard?.title ?? "Clear guidance needs a real signal")
+                        .font(OneType.title)
+                        .foregroundStyle(palette.text)
+                    Text(featuredCard?.body ?? "The coach will get sharper as you log tasks, habits, and notes. For now it stays focused on the next honest move.")
+                        .font(OneType.body)
+                        .foregroundStyle(palette.subtext)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let featuredCard {
+                        CoachVerseBlock(palette: palette, card: featuredCard)
+                        if !featuredCard.tags.isEmpty {
+                            FlowLayout(spacing: 8) {
+                                ForEach(featuredCard.tags, id: \.self) { tag in
+                                    OneChip(
+                                        palette: palette,
+                                        title: tag.capitalized,
+                                        kind: .strong
+                                    )
+                                }
+                            }
                         }
-                        .oneEntranceReveal(index: 0)
+                    } else {
+                        Text("Add a note or complete the first item in Today to give the coach a stronger read on the day.")
+                            .font(OneType.caption)
+                            .foregroundStyle(palette.subtext)
                     }
+                }
+                .oneEntranceReveal(index: 0)
 
-                    ForEach(Array(viewModel.cards.dropFirst().enumerated()), id: \.element.id) { index, card in
-                        OneSurfaceCard(palette: palette) {
-                            Text(card.title)
-                                .font(OneType.sectionTitle)
-                                .foregroundStyle(palette.text)
-                            Text(card.body)
-                                .font(OneType.body)
-                                .foregroundStyle(palette.subtext)
-                                .fixedSize(horizontal: false, vertical: true)
-                            CoachVerseBlock(palette: palette, card: card)
+                OneSurfaceCard(palette: palette) {
+                    OneSectionHeading(
+                        palette: palette,
+                        title: "Right now",
+                        meta: focusItem == nil ? "No current item" : "Today"
+                    )
+                    Text(currentGuidanceTitle)
+                        .font(OneType.sectionTitle)
+                        .foregroundStyle(palette.text)
+                    Text(currentGuidanceBody)
+                        .font(OneType.body)
+                        .foregroundStyle(palette.subtext)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .oneEntranceReveal(index: 1)
+
+                OneSurfaceCard(palette: palette) {
+                    OneSectionHeading(
+                        palette: palette,
+                        title: "Momentum",
+                        meta: weeklyMeta
+                    )
+                    Text(momentumTitle)
+                        .font(OneType.sectionTitle)
+                        .foregroundStyle(palette.text)
+                    Text(momentumBody)
+                        .font(OneType.body)
+                        .foregroundStyle(palette.subtext)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .oneEntranceReveal(index: 2)
+
+                OneSurfaceCard(palette: palette) {
+                    OneSectionHeading(
+                        palette: palette,
+                        title: "Notes signal",
+                        meta: todayNotes.isEmpty ? "No note today" : "\(todayNotes.count) today"
+                    )
+                    Text(reflectionTitle)
+                        .font(OneType.sectionTitle)
+                        .foregroundStyle(palette.text)
+                    Text(reflectionBody)
+                        .font(OneType.body)
+                        .foregroundStyle(palette.subtext)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .oneEntranceReveal(index: 3)
+
+                ForEach(Array(supportingCards.enumerated()), id: \.element.id) { index, card in
+                    OneSurfaceCard(palette: palette) {
+                        Text(card.title)
+                            .font(OneType.sectionTitle)
+                            .foregroundStyle(palette.text)
+                        Text(card.body)
+                            .font(OneType.body)
+                            .foregroundStyle(palette.subtext)
+                            .fixedSize(horizontal: false, vertical: true)
+                        CoachVerseBlock(palette: palette, card: card)
+                        if !card.tags.isEmpty {
+                            FlowLayout(spacing: 8) {
+                                ForEach(card.tags, id: \.self) { tag in
+                                    OneChip(
+                                        palette: palette,
+                                        title: tag.capitalized,
+                                        kind: .neutral
+                                    )
+                                }
+                            }
                         }
-                        .oneEntranceReveal(index: index + 1)
                     }
+                    .oneEntranceReveal(index: index + 4)
                 }
 
                 if let message = viewModel.errorMessage {
                     InlineStatusCard(message: message, kind: .danger, palette: palette)
-                        .oneEntranceReveal(index: 4)
+                        .oneEntranceReveal(index: 6)
                 }
             }
             .navigationTitle("Coach")
@@ -3075,16 +4408,143 @@ private struct CoachSheetView: View {
             }
         }
     }
+
+    private var currentGuidanceTitle: String {
+        guard let focusItem else {
+            return "Set the day with one honest commitment"
+        }
+        if focusItem.priorityTier == .urgent {
+            return "Protect \(focusItem.title)"
+        }
+        return "Keep \(focusItem.title) moving"
+    }
+
+    private var currentGuidanceBody: String {
+        guard let focusItem else {
+            return "Nothing active is carrying the day yet. Add one task, habit, or note before the plan starts diffusing."
+        }
+        if focusItem.priorityTier == .urgent {
+            return "This is carrying the most weight in Today right now. Finish the first usable step before widening the queue."
+        }
+        if remainingItems.count <= 2 {
+            return "The queue is still small. Protect the next decisive action instead of creating more motion than the day needs."
+        }
+        return "You have \(remainingItems.count) open items. The coach is narrowing your attention to the next clear step so the list stays usable."
+    }
+
+    private var weeklyMeta: String {
+        guard let weekly = analyticsViewModel.weekly else {
+            return "Waiting for signal"
+        }
+        return "\(weekly.completedItems)/\(weekly.expectedItems)"
+    }
+
+    private var momentumTitle: String {
+        guard let weekly = analyticsViewModel.weekly else {
+            return "Momentum appears after the first completions"
+        }
+        if weekly.completionRate >= 0.75 {
+            return "This week already has real traction"
+        }
+        if weekly.activeDays == 0 {
+            return "The week still needs a first rep"
+        }
+        return "The week needs a smaller, cleaner target"
+    }
+
+    private var momentumBody: String {
+        guard let weekly = analyticsViewModel.weekly else {
+            return "Once habits, tasks, and notes start moving, the coach will anchor its advice to what is actually happening."
+        }
+        if weekly.completionRate >= 0.75 {
+            return "You have finished \(weekly.completedItems) of \(weekly.expectedItems) planned items across \(weekly.activeDays) active days. Keep protecting the rhythm instead of chasing more intensity."
+        }
+        if weekly.activeDays == 0 {
+            return "No activity is recorded yet for this week. One completion is enough to turn the week from abstract to real."
+        }
+        return "You have finished \(weekly.completedItems) of \(weekly.expectedItems). Reduce the scope of the next move so you can recover momentum instead of bargaining with a heavy plan."
+    }
+
+    private var reflectionTitle: String {
+        if todayNotes.isEmpty {
+            if let dominant = reflectionSummary.dominant {
+                return "Recent notes lean \(dominant.title.lowercased())"
+            }
+            return "No note is anchoring the day yet"
+        }
+        if let dominant = reflectionSummary.dominant {
+            return "Today's notes lean \(dominant.title.lowercased())"
+        }
+        return "Today's notes are still mixed"
+    }
+
+    private var reflectionBody: String {
+        if todayNotes.isEmpty {
+            if recentNotes.isEmpty {
+                return "Write one honest line while the day is still fresh. Notes make the coach and the review screens materially sharper."
+            }
+            return "You have \(recentNotes.count) recent notes, but nothing for today yet. Capture one line while the day is still in motion so the signal stays current."
+        }
+        return "You have \(todayNotes.count) note\(todayNotes.count == 1 ? "" : "s") for today. Keep using notes when the day changes direction so guidance is built from the real pattern, not from placeholders."
+    }
+
+    private func coachCardScore(_ card: CoachCard, offset: Int, seed: Int) -> Int {
+        let tags = Set(card.tags.map { $0.lowercased() })
+        var score = seed % max(viewModel.cards.count, 1) == offset ? 4 : 0
+
+        if let focusItem, focusItem.priorityTier == .urgent || focusItem.priorityTier == .high {
+            if !tags.isDisjoint(with: ["focus", "discipline", "clarity", "stress"]) {
+                score += 8
+            }
+        }
+
+        if let weekly = analyticsViewModel.weekly, weekly.completionRate < 0.45 {
+            if !tags.isDisjoint(with: ["reset", "resilience", "recovery", "rest"]) {
+                score += 7
+            }
+        }
+
+        if let dominant = reflectionSummary.dominant {
+            switch dominant {
+            case .stressed:
+                if !tags.isDisjoint(with: ["stress", "rest", "clarity"]) {
+                    score += 6
+                }
+            case .tired:
+                if !tags.isDisjoint(with: ["fatigue", "recovery", "rest"]) {
+                    score += 6
+                }
+            case .focused:
+                if !tags.isDisjoint(with: ["focus", "discipline", "consistency"]) {
+                    score += 6
+                }
+            case .great:
+                if !tags.isDisjoint(with: ["faithfulness", "streaks", "habits"]) {
+                    score += 5
+                }
+            case .okay:
+                if !tags.isDisjoint(with: ["clarity", "planning", "consistency"]) {
+                    score += 4
+                }
+            }
+        }
+
+        return score
+    }
 }
 
 private struct TodayItemCard<Destination: View>: View {
     let palette: OneTheme.Palette
     let item: TodayItem
     let categoryName: String
-    let categoryIcon: String
+    let categoryIcon: OneIconKey
     let isReordering: Bool
     let isHighlighted: Bool
+    let isBusy: Bool
+    let allowsSwipeCompletion: Bool
+    let allowsSwipeDelete: Bool
     let onToggle: () -> Void
+    let onDelete: (() -> Void)?
     @ViewBuilder let destination: Destination
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -3181,23 +4641,29 @@ private struct TodayItemCard<Destination: View>: View {
                             .foregroundStyle(palette.subtext)
                             .padding(.top, 4)
                     }
-                    NavigationLink {
-                        destination
-                    } label: {
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(palette.accent)
+                    if isBusy {
+                        ProgressView()
+                            .controlSize(.small)
                             .frame(width: 28, height: 28)
-                            .background(
-                                RoundedRectangle(cornerRadius: OneTheme.radiusSmall, style: .continuous)
-                                    .fill(palette.surfaceMuted)
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: OneTheme.radiusSmall, style: .continuous)
-                                    .stroke(palette.border, lineWidth: 1)
-                            )
+                    } else {
+                        NavigationLink {
+                            destination
+                        } label: {
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(palette.accent)
+                                .frame(width: 28, height: 28)
+                                .background(
+                                    RoundedRectangle(cornerRadius: OneTheme.radiusSmall, style: .continuous)
+                                        .fill(palette.surfaceMuted)
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: OneTheme.radiusSmall, style: .continuous)
+                                        .stroke(palette.border, lineWidth: 1)
+                                )
+                        }
+                        .onePressable(scale: 0.96)
                     }
-                    .onePressable(scale: 0.96)
                 }
             }
         }
@@ -3217,6 +4683,23 @@ private struct TodayItemCard<Destination: View>: View {
                 .opacity(item.completed || priorityTier == .high || priorityTier == .urgent || isOverdue ? 1 : 0.2)
         }
         .scaleEffect(isHighlighted && !reduceMotion ? 0.992 : 1)
+        .opacity(isBusy ? 0.82 : 1)
+        .disabled(isBusy)
+        .swipeActions(edge: .leading, allowsFullSwipe: false) {
+            if allowsSwipeDelete, let onDelete {
+                Button(role: .destructive, action: onDelete) {
+                    Label("Delete", systemImage: "trash")
+                }
+            }
+        }
+        .swipeActions(edge: .trailing, allowsFullSwipe: allowsSwipeCompletion) {
+            if allowsSwipeCompletion {
+                Button(action: onToggle) {
+                    Label("Done", systemImage: "checkmark.circle.fill")
+                }
+                .tint(palette.success)
+            }
+        }
         .animation(
             OneMotion.animation(item.completed ? .stateChange : .dismiss, reduceMotion: reduceMotion),
             value: isHighlighted
@@ -3225,23 +4708,21 @@ private struct TodayItemCard<Destination: View>: View {
 }
 
 private struct EmojiBadge: View {
-    let symbol: String
+    let symbol: OneIconKey
     let palette: OneTheme.Palette
     var accessibilityLabel: String? = nil
 
     var body: some View {
-        Text(symbol)
-            .font(.system(size: 15))
-            .frame(width: 30, height: 30)
-            .background(
-                RoundedRectangle(cornerRadius: OneTheme.radiusSmall, style: .continuous)
-                    .fill(palette.surfaceMuted)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: OneTheme.radiusSmall, style: .continuous)
-                    .stroke(palette.border, lineWidth: 1)
-            )
-            .accessibilityLabel(accessibilityLabel ?? symbol)
+        OneIconBadge(
+            key: symbol,
+            palette: palette,
+            size: 30,
+            tint: palette.symbol,
+            background: palette.surfaceMuted,
+            border: palette.border,
+            shape: .roundedSquare
+        )
+        .accessibilityLabel(accessibilityLabel ?? symbol.accessibilityLabel)
     }
 }
 
@@ -3372,8 +4853,9 @@ private struct SentimentPickerRow: View {
                             Text(sentiment.title)
                                 .font(OneType.caption)
                                 .foregroundStyle(palette.text)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
-                            .frame(width: 82, height: 64)
+                            .frame(minWidth: 92, minHeight: 74)
                             .scaleEffect(selectedSentiment == sentiment && !reduceMotion ? 1.04 : 1)
                             .background(
                                 RoundedRectangle(cornerRadius: OneTheme.radiusSmall, style: .continuous)
@@ -3406,8 +4888,12 @@ private struct CompactTodayPreviewRow: View {
                 .fill(item.completed ? palette.success.opacity(0.2) : palette.surfaceStrong)
                 .frame(width: 34, height: 34)
                 .overlay(
-                    Image(systemName: item.completed ? "checkmark" : (item.itemType == .habit ? "repeat" : "checklist"))
-                        .foregroundStyle(item.completed ? palette.success : palette.symbol)
+                    OneIcon(
+                        key: item.completed ? .success : (item.itemType == .habit ? .habit : .task),
+                        palette: palette,
+                        size: 16,
+                        tint: item.completed ? palette.success : palette.symbol
+                    )
                 )
             VStack(alignment: .leading, spacing: 2) {
                 Text(item.title)
@@ -3431,10 +4917,138 @@ private struct CompactTodayPreviewRow: View {
     }
 }
 
+private struct CompactTodayActionRow<Destination: View>: View {
+    let palette: OneTheme.Palette
+    let item: TodayItem
+    let categoryName: String
+    let isHighlighted: Bool
+    let isBusy: Bool
+    let allowsSwipeCompletion: Bool
+    let allowsSwipeDelete: Bool
+    let onToggle: () -> Void
+    let onDelete: (() -> Void)?
+    @ViewBuilder let destination: Destination
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var supportingLine: String? {
+        if let dueAt = item.dueAt {
+            return "Due \(OneDate.dateTimeString(from: dueAt))"
+        }
+        if let preferredTime = item.preferredTime, !preferredTime.isEmpty {
+            return "Around \(preferredTime)"
+        }
+        return item.subtitle
+    }
+
+    private var emphasisColor: Color {
+        if item.priorityTier == .urgent {
+            return palette.danger
+        }
+        if item.priorityTier == .high {
+            return palette.highlight
+        }
+        return palette.accent
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button(action: onToggle) {
+                Image(systemName: item.completed ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 21, weight: .semibold))
+                    .foregroundStyle(item.completed ? palette.success : palette.subtext)
+            }
+            .onePressable(scale: 0.92, opacity: 0.84)
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(item.title)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(item.completed ? palette.subtext : palette.text)
+                        .lineLimit(1)
+                    if item.priorityTier == .high || item.priorityTier == .urgent {
+                        Text(item.priorityTier.title)
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(emphasisColor)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 3)
+                            .background(
+                                Capsule(style: .continuous)
+                                    .fill(emphasisColor.opacity(0.12))
+                            )
+                    }
+                }
+                if let supportingLine, !supportingLine.isEmpty {
+                    Text(supportingLine)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(palette.subtext)
+                        .lineLimit(1)
+                }
+                Text("\(item.itemType == .habit ? "Habit" : "Task") · \(categoryName)")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(palette.subtext.opacity(0.9))
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 8)
+
+            if isBusy {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(width: 28, height: 28)
+            } else {
+                NavigationLink {
+                    destination
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(palette.accent)
+                        .frame(width: 28, height: 28)
+                        .background(
+                            RoundedRectangle(cornerRadius: OneTheme.radiusSmall, style: .continuous)
+                                .fill(palette.surfaceMuted)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: OneTheme.radiusSmall, style: .continuous)
+                                .stroke(palette.border, lineWidth: 1)
+                        )
+                }
+                .onePressable(scale: 0.96)
+            }
+        }
+        .padding(.vertical, 10)
+        .padding(.horizontal, 2)
+        .background(
+            RoundedRectangle(cornerRadius: OneTheme.radiusMedium, style: .continuous)
+                .fill(isHighlighted ? palette.accentSoft.opacity(palette.isDark ? 0.72 : 0.9) : Color.clear)
+        )
+        .opacity(isBusy ? 0.82 : 1)
+        .disabled(isBusy)
+        .swipeActions(edge: .leading, allowsFullSwipe: false) {
+            if allowsSwipeDelete, let onDelete {
+                Button(role: .destructive, action: onDelete) {
+                    Label("Delete", systemImage: "trash")
+                }
+            }
+        }
+        .swipeActions(edge: .trailing, allowsFullSwipe: allowsSwipeCompletion) {
+            if allowsSwipeCompletion {
+                Button(action: onToggle) {
+                    Label("Done", systemImage: "checkmark.circle.fill")
+                }
+                .tint(palette.success)
+            }
+        }
+        .animation(
+            OneMotion.animation(.stateChange, reduceMotion: reduceMotion),
+            value: isHighlighted
+        )
+    }
+}
+
 private struct HomeHabitCategoryGroup: Identifiable {
     let categoryId: String
     let categoryName: String
-    let categoryIcon: String
+    let categoryIcon: OneIconKey
     let habits: [Habit]
 
     var id: String { categoryId }
@@ -3446,13 +5060,15 @@ private struct HomeHabitCategoryGroupRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Circle()
-                .fill(palette.surfaceStrong)
-                .frame(width: 36, height: 36)
-                .overlay(
-                    Text(group.categoryIcon)
-                        .font(.system(size: 18))
-                )
+            OneIconBadge(
+                key: group.categoryIcon,
+                palette: palette,
+                size: 36,
+                tint: palette.symbol,
+                background: palette.surfaceStrong,
+                border: palette.border,
+                shape: .circle
+            )
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(group.categoryName)
@@ -3498,7 +5114,7 @@ private struct HabitCategorySheetView: View {
         category?.name ?? "Category"
     }
 
-    private var categoryIcon: String {
+    private var categoryIcon: OneIconKey {
         actionQueueCategoryIcon(name: category?.name ?? "Category", storedIcon: category?.icon)
     }
 
@@ -3513,13 +5129,15 @@ private struct HabitCategorySheetView: View {
             OneScrollScreen(palette: palette) {
                 OneSurfaceCard(palette: palette) {
                     HStack(spacing: 12) {
-                        Circle()
-                            .fill(palette.surfaceStrong)
-                            .frame(width: 42, height: 42)
-                            .overlay(
-                                Text(categoryIcon)
-                                    .font(.system(size: 20))
-                            )
+                        OneIconBadge(
+                            key: categoryIcon,
+                            palette: palette,
+                            size: 42,
+                            tint: palette.symbol,
+                            background: palette.surfaceStrong,
+                            border: palette.border,
+                            shape: .circle
+                        )
                         VStack(alignment: .leading, spacing: 4) {
                             Text(categoryName)
                                 .font(.system(size: 16, weight: .semibold))
@@ -3588,7 +5206,7 @@ private struct ActiveHabitHomeRow: View {
     let palette: OneTheme.Palette
     let habit: Habit
     let categoryName: String
-    let categoryIcon: String
+    let categoryIcon: OneIconKey
 
     private var recurrenceSummary: String {
         HabitRecurrenceRule(rawValue: habit.recurrenceRule).summary
@@ -3603,13 +5221,15 @@ private struct ActiveHabitHomeRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            Circle()
-                .fill(palette.surfaceStrong)
-                .frame(width: 34, height: 34)
-                .overlay(
-                    Text("🔁")
-                        .font(.system(size: 16))
-                )
+            OneIconBadge(
+                key: .habit,
+                palette: palette,
+                size: 34,
+                tint: palette.accent,
+                background: palette.surfaceStrong,
+                border: palette.border,
+                shape: .circle
+            )
 
             VStack(alignment: .leading, spacing: 6) {
                 Text(habit.title)
@@ -3728,47 +5348,6 @@ private struct SummaryMetricTile: View {
     }
 }
 
-private struct QuickActionTile: View {
-    let palette: OneTheme.Palette
-    let icon: String
-    let title: String
-    let subtitle: String
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            VStack(alignment: .leading, spacing: 10) {
-                Circle()
-                    .fill(palette.accentSoft)
-                    .frame(width: 42, height: 42)
-                    .overlay(
-                        Image(systemName: icon)
-                            .foregroundStyle(palette.accent)
-                    )
-                Text(title)
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(palette.text)
-                    .multilineTextAlignment(.leading)
-                Text(subtitle)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(palette.subtext)
-                    .multilineTextAlignment(.leading)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(12)
-            .background(
-                RoundedRectangle(cornerRadius: OneTheme.radiusMedium, style: .continuous)
-                    .fill(palette.surface)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: OneTheme.radiusMedium, style: .continuous)
-                    .stroke(palette.border, lineWidth: 1)
-            )
-        }
-        .buttonStyle(.plain)
-    }
-}
-
 private struct CoachVerseBlock: View {
     let palette: OneTheme.Palette
     let card: CoachCard
@@ -3840,8 +5419,12 @@ private struct InlineStatusCard: View {
     var body: some View {
         OneSurfaceCard(palette: palette) {
             HStack(spacing: 10) {
-                Image(systemName: kind == .danger ? "exclamationmark.triangle.fill" : "info.circle.fill")
-                    .foregroundStyle(kind == .danger ? palette.danger : palette.accent)
+                OneIcon(
+                    key: kind == .danger ? .warning : .coachInsight,
+                    palette: palette,
+                    size: 16,
+                    tint: kind == .danger ? palette.danger : palette.accent
+                )
                 Text(message)
                     .font(OneType.secondary)
                     .foregroundStyle(kind == .danger ? palette.danger : palette.text)
@@ -3955,18 +5538,20 @@ private struct OneTextEditorField: View {
             ZStack(alignment: .topLeading) {
                 RoundedRectangle(cornerRadius: OneTheme.radiusMedium, style: .continuous)
                     .fill(palette.surfaceMuted)
+                RoundedRectangle(cornerRadius: OneTheme.radiusMedium, style: .continuous)
+                    .stroke(palette.border, lineWidth: 1)
                 if let isFocused {
                     TextEditor(text: $text)
                         .focused(isFocused)
                         .scrollContentBackground(.hidden)
-                        .frame(minHeight: 92)
+                        .frame(minHeight: 120)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 8)
                         .foregroundStyle(palette.text)
                 } else {
                     TextEditor(text: $text)
                         .scrollContentBackground(.hidden)
-                        .frame(minHeight: 92)
+                        .frame(minHeight: 120)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 8)
                         .foregroundStyle(palette.text)
@@ -4376,17 +5961,21 @@ private struct AnalyticsYearContributionView: View {
     let palette: OneTheme.Palette
     let sections: [AnalyticsContributionMonthSection]
     let onSelectDate: (String) -> Void
+    private let columns = Array(repeating: GridItem(.flexible(), spacing: 10), count: 2)
 
     var body: some View {
-        VStack(spacing: 12) {
-            ForEach(sections) { section in
-                AnalyticsMonthContributionSection(
-                    palette: palette,
-                    section: section,
-                    onSelectDate: onSelectDate
-                )
+        ScrollView(.vertical, showsIndicators: false) {
+            LazyVGrid(columns: columns, spacing: 10) {
+                ForEach(sections) { section in
+                    AnalyticsMonthContributionSection(
+                        palette: palette,
+                        section: section,
+                        onSelectDate: onSelectDate
+                    )
+                }
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 }
 
@@ -4399,28 +5988,28 @@ private struct AnalyticsMonthContributionSection: View {
     private let weekdaySymbols = ["S", "M", "T", "W", "T", "F", "S"]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text(section.label)
-                    .font(OneType.body)
+                    .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(palette.text)
                 Spacer()
                 Text("\(section.completedItems)/\(section.expectedItems)")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(palette.subtext)
             }
 
             LazyVGrid(columns: columns, spacing: 4) {
                 ForEach(Array(weekdaySymbols.enumerated()), id: \.offset) { _, symbol in
                     Text(symbol)
-                        .font(.system(size: 9, weight: .bold))
+                        .font(.system(size: 7, weight: .bold))
                         .foregroundStyle(palette.subtext)
                         .frame(maxWidth: .infinity)
                 }
 
                 ForEach(0..<section.leadingPlaceholders, id: \.self) { _ in
                     Color.clear
-                        .frame(height: 22)
+                        .frame(height: 16)
                 }
 
                 ForEach(section.days) { day in
@@ -4429,14 +6018,14 @@ private struct AnalyticsMonthContributionSection: View {
                     } label: {
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
                             .fill(contributionFill(for: day.completionRate, palette: palette))
-                            .frame(height: 22)
+                            .frame(height: 16)
                             .overlay(
                                 RoundedRectangle(cornerRadius: 6, style: .continuous)
                                     .stroke(palette.border.opacity(0.55), lineWidth: 0.5)
                             )
                             .overlay {
                                 Text("\(day.dayNumber)")
-                                    .font(.system(size: 8, weight: .bold))
+                                    .font(.system(size: 7, weight: .bold))
                                     .foregroundStyle(palette.text.opacity(day.hasSummary ? 0.78 : 0.45))
                             }
                     }
@@ -4444,7 +6033,7 @@ private struct AnalyticsMonthContributionSection: View {
                 }
             }
         }
-        .padding(12)
+        .padding(10)
         .background(
             RoundedRectangle(cornerRadius: OneTheme.radiusMedium, style: .continuous)
                 .fill(palette.surfaceMuted)
@@ -4647,25 +6236,8 @@ private struct WrappingFlowLayout: Layout {
     }
 }
 
-private func actionQueueCategoryIcon(name: String, storedIcon: String?) -> String {
-    if let storedIcon, !storedIcon.isEmpty, storedIcon != "circle" {
-        return storedIcon
-    }
-
-    switch name {
-    case "Gym":
-        return "🏋️"
-    case "School":
-        return "🎓"
-    case "Personal Projects":
-        return "💡"
-    case "Wellbeing":
-        return "🌿"
-    case "Life Admin":
-        return "🧾"
-    default:
-        return "◻️"
-    }
+private func actionQueueCategoryIcon(name: String, storedIcon: String?) -> OneIconKey {
+    OneIconKey.taskCategory(name: name, storedIcon: storedIcon)
 }
 
 private func priorityTierColor(for tier: PriorityTier, palette: OneTheme.Palette) -> Color {
@@ -4872,84 +6444,6 @@ enum OneDate {
         }
         return canonicalCalendar.range(of: .day, in: .month, for: date)?.count ?? 30
     }
-}
-
-private enum OneNavigationBarDisplayMode {
-    case automatic
-    case inline
-    case large
-}
-
-private extension ToolbarItemPlacement {
-    static var oneNavigationLeading: ToolbarItemPlacement {
-        #if os(iOS)
-        .navigationBarLeading
-        #else
-        .automatic
-        #endif
-    }
-
-    static var oneNavigationTrailing: ToolbarItemPlacement {
-        #if os(iOS)
-        .navigationBarTrailing
-        #else
-        .primaryAction
-        #endif
-    }
-}
-
-private extension View {
-    @ViewBuilder
-    func oneNavigationBarDisplayMode(_ displayMode: OneNavigationBarDisplayMode) -> some View {
-        #if os(iOS)
-        switch displayMode {
-        case .automatic:
-            self.navigationBarTitleDisplayMode(.automatic)
-        case .inline:
-            self.navigationBarTitleDisplayMode(.inline)
-        case .large:
-            self.navigationBarTitleDisplayMode(.large)
-        }
-        #else
-        self
-        #endif
-    }
-
-    @ViewBuilder
-    func oneInlineNavigationBarTitle() -> some View {
-        #if os(iOS)
-        self.oneNavigationBarDisplayMode(.inline)
-        #else
-        self
-        #endif
-    }
-
-    @ViewBuilder
-    func oneListRowSpacing(_ spacing: CGFloat) -> some View {
-        #if os(iOS)
-        self.listRowSpacing(spacing)
-        #else
-        self
-        #endif
-    }
-
-    @ViewBuilder
-    func onePlainTextInputBehavior() -> some View {
-        #if os(iOS)
-        self
-            .textInputAutocapitalization(.never)
-            .autocorrectionDisabled()
-        #else
-        self
-        #endif
-    }
-
-    #if os(iOS)
-    @ViewBuilder
-    func oneListEditing(editMode: Binding<EditMode>) -> some View {
-        self.environment(\.editMode, editMode)
-    }
-    #endif
 }
 
 #if os(iOS)

@@ -34,46 +34,46 @@ public enum OneTheme {
         case .dark:
             return Palette(
                 isDark: true,
-                background: Color(hex: 0x111315),
-                backgroundTop: Color(hex: 0x181B1F),
-                surface: Color(hex: 0x1B2026),
-                surfaceMuted: Color(hex: 0x15191E),
-                surfaceStrong: Color(hex: 0x262C34),
-                glass: Color(hex: 0x1D232A, alpha: 0.96),
-                glassStroke: Color.white.opacity(0.08),
-                border: Color.white.opacity(0.09),
-                text: Color(hex: 0xF2F4F7),
-                subtext: Color(hex: 0xA1ACBC),
-                accent: Color(hex: 0x6C8EAD),
-                accentSoft: Color(hex: 0x6C8EAD, alpha: 0.18),
-                success: Color(hex: 0x61B97B),
-                danger: Color(hex: 0xD97768),
-                warning: Color(hex: 0xD8AE62),
-                highlight: Color(hex: 0xC08B58),
-                symbol: Color(hex: 0xD7DEE7),
-                shadowColor: Color.black.opacity(0.22)
+                background: Color(hex: 0x101215),
+                backgroundTop: Color(hex: 0x14191F),
+                surface: Color(hex: 0x171C23),
+                surfaceMuted: Color(hex: 0x12161D),
+                surfaceStrong: Color(hex: 0x202734),
+                glass: Color(hex: 0x18202A, alpha: 0.98),
+                glassStroke: Color.white.opacity(0.05),
+                border: Color.white.opacity(0.08),
+                text: Color(hex: 0xF3F5F8),
+                subtext: Color(hex: 0xA2ADBC),
+                accent: Color(hex: 0x7A9DBA),
+                accentSoft: Color(hex: 0x7A9DBA, alpha: 0.16),
+                success: Color(hex: 0x6EB082),
+                danger: Color(hex: 0xD47B6D),
+                warning: Color(hex: 0xD1A86A),
+                highlight: Color(hex: 0xC08A56),
+                symbol: Color(hex: 0xD5DEE8),
+                shadowColor: Color.black.opacity(0.16)
             )
         default:
             return Palette(
                 isDark: false,
-                background: Color(hex: 0xF4F5F7),
-                backgroundTop: Color(hex: 0xFAFBFC),
+                background: Color(hex: 0xF2F4F7),
+                backgroundTop: Color(hex: 0xFAFBFD),
                 surface: Color.white,
-                surfaceMuted: Color(hex: 0xF7F8FA),
-                surfaceStrong: Color(hex: 0xEFF2F6),
-                glass: Color.white.opacity(0.96),
-                glassStroke: Color(hex: 0x111827, alpha: 0.06),
-                border: Color(hex: 0x111827, alpha: 0.08),
-                text: Color(hex: 0x151A21),
-                subtext: Color(hex: 0x697487),
-                accent: Color(hex: 0x4A6C88),
-                accentSoft: Color(hex: 0x4A6C88, alpha: 0.14),
-                success: Color(hex: 0x4E8F64),
-                danger: Color(hex: 0xC66B5C),
-                warning: Color(hex: 0xBE9150),
-                highlight: Color(hex: 0xB57945),
-                symbol: Color(hex: 0x495669),
-                shadowColor: Color.black.opacity(0.06)
+                surfaceMuted: Color(hex: 0xF5F7FA),
+                surfaceStrong: Color(hex: 0xE9EDF3),
+                glass: Color.white.opacity(0.98),
+                glassStroke: Color(hex: 0x111827, alpha: 0.04),
+                border: Color(hex: 0x111827, alpha: 0.07),
+                text: Color(hex: 0x151B24),
+                subtext: Color(hex: 0x677486),
+                accent: Color(hex: 0x4D6F8C),
+                accentSoft: Color(hex: 0x4D6F8C, alpha: 0.12),
+                success: Color(hex: 0x4D8A62),
+                danger: Color(hex: 0xC0675A),
+                warning: Color(hex: 0xBB8B4B),
+                highlight: Color(hex: 0xAF7440),
+                symbol: Color(hex: 0x465466),
+                shadowColor: Color.black.opacity(0.04)
             )
         }
     }
@@ -120,22 +120,22 @@ public extension Color {
 
 enum OneDockLayout {
     static let horizontalInset: CGFloat = 18
-    static let tabBarLift: CGFloat = 12
-    static let dockOrbSize: CGFloat = 0
-    static let contentClearance: CGFloat = 16
-    static let expandedClearance: CGFloat = 0
-    static let overlayStackSpacing: CGFloat = 12
+    static let tabBarLift: CGFloat = -10
+    static let dockOrbSize: CGFloat = 58
+    static let quickAddBubbleWidth: CGFloat = 218
+    static let quickAddBubbleOverlap: CGFloat = 12
+    static let overlayStackSpacing: CGFloat = 10
 
     static var tabScreenBottomPadding: CGFloat {
         32
     }
 
     static var listBottomSpacerHeight: CGFloat {
-        12
+        16
     }
 
-    static func overlayBottomInset(safeAreaBottom: CGFloat, isExpanded: Bool) -> CGFloat {
-        safeAreaBottom + tabBarLift + (isExpanded ? expandedClearance : 0)
+    static func overlayBottomInset(safeAreaBottom: CGFloat) -> CGFloat {
+        safeAreaBottom + tabBarLift
     }
 }
 
@@ -143,28 +143,19 @@ struct OneScreenBackground: View {
     let palette: OneTheme.Palette
 
     var body: some View {
-        ZStack {
-            LinearGradient(
-                colors: [palette.backgroundTop, palette.background, palette.background],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            .overlay(alignment: .topLeading) {
-                RoundedRectangle(cornerRadius: 0)
-                    .fill(palette.accentSoft.opacity(palette.isDark ? 0.32 : 0.18))
-                    .frame(height: 180)
-                    .blur(radius: 40)
-                    .offset(y: -100)
-            }
-            .overlay(alignment: .topTrailing) {
-                Circle()
-                    .fill(palette.highlight.opacity(palette.isDark ? 0.12 : 0.08))
-                    .frame(width: 220, height: 220)
-                    .blur(radius: 60)
-                    .offset(x: 70, y: -110)
-            }
-            .ignoresSafeArea()
+        LinearGradient(
+            colors: [palette.backgroundTop, palette.background],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(palette.accentSoft.opacity(palette.isDark ? 0.2 : 0.1))
+                .frame(height: 132)
+                .blur(radius: 34)
+                .offset(y: -72)
         }
+        .ignoresSafeArea()
     }
 }
 
@@ -216,6 +207,7 @@ struct OneScrollScreen<Content: View>: View {
                 dockVisibility.register(offset: offset)
             }
         }
+        .oneKeyboardDismissible()
     }
 }
 
@@ -249,19 +241,20 @@ struct OneGlassCard<Content: View>: View {
         .padding(padding)
         .background(
             RoundedRectangle(cornerRadius: OneTheme.radiusLarge, style: .continuous)
-                .fill(
-                    LinearGradient(
-                        colors: [palette.surface, palette.surfaceMuted],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                )
+                .fill(palette.glass)
         )
         .overlay(
             RoundedRectangle(cornerRadius: OneTheme.radiusLarge, style: .continuous)
-                .stroke(palette.glassStroke, lineWidth: 1)
+                .stroke(palette.accentSoft.opacity(palette.isDark ? 0.44 : 0.72), lineWidth: 1)
         )
-        .shadow(color: palette.shadowColor, radius: 10, x: 0, y: 6)
+        .overlay(alignment: .topLeading) {
+            RoundedRectangle(cornerRadius: OneTheme.radiusSmall, style: .continuous)
+                .fill(palette.accent.opacity(palette.isDark ? 0.85 : 0.7))
+                .frame(width: 68, height: 4)
+                .padding(.leading, padding)
+                .padding(.top, 10)
+        }
+        .shadow(color: palette.shadowColor, radius: 8, x: 0, y: 4)
     }
 }
 
@@ -293,7 +286,7 @@ struct OneSurfaceCard<Content: View>: View {
             RoundedRectangle(cornerRadius: OneTheme.radiusLarge, style: .continuous)
                 .stroke(palette.border, lineWidth: 1)
         )
-        .shadow(color: palette.shadowColor, radius: 6, x: 0, y: 3)
+        .shadow(color: palette.shadowColor, radius: 3, x: 0, y: 1)
     }
 }
 
@@ -356,20 +349,7 @@ struct OneMarkBadge: View {
     let palette: OneTheme.Palette
 
     var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(
-                    LinearGradient(
-                        colors: [Color(hex: 0x12161B), Color(hex: 0x28313B)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
-                .frame(width: 54, height: 54)
-            Text("1")
-                .font(.system(size: 28, weight: .bold))
-                .foregroundStyle(Color.white)
-        }
+        OneBrandMark(size: 54)
     }
 }
 
@@ -577,6 +557,8 @@ struct OneSegmentedControl<Option: Hashable>: View {
                     Text(title(option))
                         .font(OneType.secondary)
                         .frame(maxWidth: .infinity)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
                         .padding(.vertical, 11)
                         .foregroundStyle(selection == option ? palette.text : palette.subtext)
                         .background(alignment: .center) {
@@ -616,6 +598,7 @@ struct OneActionButton: View {
     let title: String
     let style: Style
     let action: () -> Void
+    @Environment(\.isEnabled) private var isEnabled
 
     var body: some View {
         Button(action: action) {
@@ -630,15 +613,16 @@ struct OneActionButton: View {
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: OneTheme.radiusMedium, style: .continuous)
-                        .stroke(style == .primary ? Color.clear : palette.border, lineWidth: 1)
+                        .stroke(style == .primary ? palette.accent.opacity(0.14) : palette.border, lineWidth: 1)
                 )
         }
         .onePressable(scale: 0.985)
+        .opacity(isEnabled ? 1 : 0.55)
     }
 
     private var primaryFill: LinearGradient {
         LinearGradient(
-            colors: [palette.accent, palette.highlight.opacity(0.92)],
+            colors: [palette.accent, palette.accent.opacity(0.86)],
             startPoint: .top,
             endPoint: .bottom
         )
@@ -671,28 +655,35 @@ struct PriorityTierSelector: View {
                         OneHaptics.shared.trigger(.selectionChanged)
                         onSelect(tier)
                     } label: {
-                        HStack(spacing: 12) {
+                        HStack(alignment: .top, spacing: 12) {
                             Circle()
                                 .fill(priorityTierColor(for: tier, palette: palette))
                                 .frame(width: 12, height: 12)
+                                .padding(.top, 4)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(tier.title)
                                     .font(OneType.body.weight(.semibold))
                                     .foregroundStyle(palette.text)
+                                    .fixedSize(horizontal: false, vertical: true)
                                 Text(tier.helperText)
                                     .font(OneType.caption)
                                     .foregroundStyle(palette.subtext)
                                     .multilineTextAlignment(.leading)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
+                            .frame(maxWidth: .infinity, alignment: .leading)
                             Spacer()
                             if selection == tier {
                                 Image(systemName: "checkmark.circle.fill")
                                     .font(.system(size: 17, weight: .semibold))
                                     .foregroundStyle(priorityTierColor(for: tier, palette: palette))
+                                    .padding(.top, 2)
                             }
                         }
                         .padding(.horizontal, 12)
-                        .padding(.vertical, 12)
+                        .padding(.vertical, 14)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .frame(minHeight: 72, alignment: .leading)
                         .background(
                             RoundedRectangle(cornerRadius: OneTheme.radiusMedium, style: .continuous)
                                 .fill(selection == tier ? priorityTierColor(for: tier, palette: palette).opacity(0.14) : palette.surfaceMuted)
@@ -724,21 +715,22 @@ struct PriorityTierSelector: View {
 
 struct OneSettingsRow: View {
     let palette: OneTheme.Palette
-    let icon: String
+    let iconKey: OneIconKey
     let title: String
     let meta: String
     let tail: String?
 
     var body: some View {
         HStack(spacing: 12) {
-            Circle()
-                .fill(palette.surfaceStrong)
-                .frame(width: 38, height: 38)
-                .overlay(
-                    Image(systemName: icon)
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(palette.symbol)
-                )
+            OneIconBadge(
+                key: iconKey,
+                palette: palette,
+                size: 38,
+                tint: palette.symbol,
+                background: palette.surfaceStrong,
+                border: palette.border,
+                shape: .circle
+            )
             VStack(alignment: .leading, spacing: 3) {
                 Text(title)
                     .font(.system(size: 15, weight: .semibold))
@@ -765,5 +757,101 @@ extension Collection {
     subscript(safe index: Index) -> Element? {
         indices.contains(index) ? self[index] : nil
     }
+}
+
+enum OneNavigationBarDisplayMode {
+    case automatic
+    case inline
+    case large
+}
+
+extension ToolbarItemPlacement {
+    static var oneNavigationLeading: ToolbarItemPlacement {
+        #if os(iOS)
+        .navigationBarLeading
+        #else
+        .automatic
+        #endif
+    }
+
+    static var oneNavigationTrailing: ToolbarItemPlacement {
+        #if os(iOS)
+        .navigationBarTrailing
+        #else
+        .primaryAction
+        #endif
+    }
+}
+
+extension View {
+    @ViewBuilder
+    func oneNavigationBarDisplayMode(_ displayMode: OneNavigationBarDisplayMode) -> some View {
+        #if os(iOS)
+        switch displayMode {
+        case .automatic:
+            self.navigationBarTitleDisplayMode(.automatic)
+        case .inline:
+            self.navigationBarTitleDisplayMode(.inline)
+        case .large:
+            self.navigationBarTitleDisplayMode(.large)
+        }
+        #else
+        self
+        #endif
+    }
+
+    @ViewBuilder
+    func oneInlineNavigationBarTitle() -> some View {
+        #if os(iOS)
+        self.oneNavigationBarDisplayMode(.inline)
+        #else
+        self
+        #endif
+    }
+
+    @ViewBuilder
+    func oneListRowSpacing(_ spacing: CGFloat) -> some View {
+        #if os(iOS)
+        self.listRowSpacing(spacing)
+        #else
+        self
+        #endif
+    }
+
+    @ViewBuilder
+    func onePlainTextInputBehavior() -> some View {
+        #if os(iOS)
+        self
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+        #else
+        self
+        #endif
+    }
+
+    @ViewBuilder
+    func oneDecimalInput() -> some View {
+        #if os(iOS)
+        self.keyboardType(.decimalPad)
+        #else
+        self
+        #endif
+    }
+
+    @ViewBuilder
+    func oneNumberInput() -> some View {
+        #if os(iOS)
+        self.keyboardType(.numberPad)
+        #else
+        self
+        #endif
+    }
+
+    #if os(iOS)
+    @ViewBuilder
+    func oneListEditing(editMode: Binding<EditMode>) -> some View {
+        self.environment(\.editMode, editMode)
+    }
+    #endif
 }
 #endif
