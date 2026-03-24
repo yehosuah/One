@@ -155,7 +155,7 @@ public struct Category: Codable, Sendable, Equatable, Identifiable {
         id: String,
         userId: String,
         name: String,
-        icon: String = "circle",
+        icon: String = OneIconKey.categoryGeneric.rawValue,
         color: String = "#5B8DEF",
         sortOrder: Int = 0,
         isDefault: Bool = false,
@@ -640,8 +640,10 @@ public struct HabitUpdateInput: Codable, Sendable, Equatable {
     public var notes: String?
     public var recurrenceRule: String?
     public var endDate: String?
+    public var clearEndDate: Bool
     public var priorityWeight: Int?
     public var preferredTime: String?
+    public var clearPreferredTime: Bool
     public var isActive: Bool?
 
     public init(
@@ -650,8 +652,10 @@ public struct HabitUpdateInput: Codable, Sendable, Equatable {
         notes: String? = nil,
         recurrenceRule: String? = nil,
         endDate: String? = nil,
+        clearEndDate: Bool = false,
         priorityWeight: Int? = nil,
         preferredTime: String? = nil,
+        clearPreferredTime: Bool = false,
         isActive: Bool? = nil
     ) {
         self.categoryId = categoryId
@@ -659,8 +663,10 @@ public struct HabitUpdateInput: Codable, Sendable, Equatable {
         self.notes = notes
         self.recurrenceRule = recurrenceRule
         self.endDate = endDate
+        self.clearEndDate = clearEndDate
         self.priorityWeight = priorityWeight
         self.preferredTime = preferredTime
+        self.clearPreferredTime = clearPreferredTime
         self.isActive = isActive
     }
 }
@@ -670,6 +676,7 @@ public struct TodoUpdateInput: Codable, Sendable, Equatable {
     public var title: String?
     public var notes: String?
     public var dueAt: Date?
+    public var clearDueAt: Bool
     public var priority: Int?
     public var isPinned: Bool?
     public var status: TodoStatus?
@@ -679,6 +686,7 @@ public struct TodoUpdateInput: Codable, Sendable, Equatable {
         title: String? = nil,
         notes: String? = nil,
         dueAt: Date? = nil,
+        clearDueAt: Bool = false,
         priority: Int? = nil,
         isPinned: Bool? = nil,
         status: TodoStatus? = nil
@@ -687,6 +695,7 @@ public struct TodoUpdateInput: Codable, Sendable, Equatable {
         self.title = title
         self.notes = notes
         self.dueAt = dueAt
+        self.clearDueAt = clearDueAt
         self.priority = priority
         self.isPinned = isPinned
         self.status = status

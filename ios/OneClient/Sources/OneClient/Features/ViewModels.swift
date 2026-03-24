@@ -984,15 +984,14 @@ public final class AnalyticsViewModel: ObservableObject {
             )
         case .yearly:
             let grouped = Dictionary(grouping: summaries) { OneDate.monthBucket(from: $0.dateLocal) }
-            let keys = grouped.keys.sorted()
             return AnalyticsChartSeries(
-                values: keys.map { key in
-                    let entries = grouped[key] ?? []
+                values: (1...12).map { month in
+                    let entries = grouped[month] ?? []
                     let completed = Double(entries.reduce(0) { $0 + $1.completedItems })
                     let expected = Double(entries.reduce(0) { $0 + $1.expectedItems })
                     return expected == 0 ? 0 : completed / expected
                 },
-                labels: keys.map { OneDate.shortMonth(for: $0) }
+                labels: (1...12).map(OneDate.shortMonth(for:))
             )
         case .daily:
             return AnalyticsChartSeries()

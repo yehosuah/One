@@ -266,6 +266,69 @@ final class OneAppTests: XCTestCase {
         try await assertWeeklyHabitStaysOnConfiguredWeekdayAcrossDeviceTimezones()
     }
 
+    func testOfflineUpdatesCanClearOptionalTaskFields() async throws {
+        let sessionStore = InMemoryAuthSessionStore()
+        let stack = try LocalPersistenceFactory.makeInMemory(sessionStore: sessionStore)
+        let authRepository = DefaultAuthRepository(apiClient: stack.apiClient)
+        let tasksRepository = DefaultTasksRepository(apiClient: stack.apiClient, syncQueue: stack.syncQueue)
+
+        _ = try await authRepository.signup(
+            email: "clear-fields@one.local",
+            password: "offline-local-profile",
+            displayName: "Clear Fields",
+            timezone: "America/Guatemala"
+        )
+
+        let categories = try await tasksRepository.loadCategories()
+        let dueAt = ISO8601DateFormatter().date(from: "2026-03-18T14:30:00Z")
+
+        let habit = try await tasksRepository.createHabit(
+            HabitCreateInput(
+                categoryId: categories[0].id,
+                title: "Deep work",
+                recurrenceRule: "DAILY",
+                startDate: "2026-03-12",
+                endDate: "2026-03-31",
+                preferredTime: "08:30:00"
+            )
+        )
+        let todo = try await tasksRepository.createTodo(
+            TodoCreateInput(
+                categoryId: categories[1].id,
+                title: "Submit report",
+                dueAt: dueAt
+            )
+        )
+
+        let clearedHabit = try await tasksRepository.updateHabit(
+            id: habit.id,
+            input: HabitUpdateInput(
+                clearEndDate: true,
+                clearPreferredTime: true
+            ),
+            clientUpdatedAt: Date()
+        )
+        let clearedTodo = try await tasksRepository.updateTodo(
+            id: todo.id,
+            input: TodoUpdateInput(
+                clearDueAt: true
+            ),
+            clientUpdatedAt: Date()
+        )
+
+        XCTAssertNil(clearedHabit.endDate)
+        XCTAssertNil(clearedHabit.preferredTime)
+        XCTAssertNil(clearedTodo.dueAt)
+
+        let persistedHabits = try await tasksRepository.loadHabits()
+        let persistedTodos = try await tasksRepository.loadTodos()
+        let persistedHabit = persistedHabits.first(where: { $0.id == habit.id })
+        let persistedTodo = persistedTodos.first(where: { $0.id == todo.id })
+        XCTAssertNil(persistedHabit?.endDate)
+        XCTAssertNil(persistedHabit?.preferredTime)
+        XCTAssertNil(persistedTodo?.dueAt)
+    }
+
     func testOfflineTodayOrdersNewestSamePriorityTodoFirst() async throws {
         let sessionStore = InMemoryAuthSessionStore()
         let stack = try LocalPersistenceFactory.makeInMemory(sessionStore: sessionStore)
@@ -663,6 +726,78 @@ final class OneAppTests: XCTestCase {
         XCTAssertEqual(viewModel.contributionSections.count, 12)
     }
 
+    func testAnalyticsYearlyChartPadsMissingMonths() async throws {
+        let repository = AnalyticsStubRepository(
+            period: PeriodSummary(
+                periodType: .yearly,
+                periodStart: "2026-01-01",
+                periodEnd: "2026-12-31",
+                completedItems: 6,
+                expectedItems: 8,
+                completionRate: 0.75,
+                activeDays: 2,
+                consistencyScore: 0.7
+            ),
+            daily: [
+                DailySummary(
+                    dateLocal: "2026-01-04",
+                    completedItems: 2,
+                    expectedItems: 3,
+                    completionRate: 2.0 / 3.0,
+                    habitCompleted: 1,
+                    habitExpected: 2,
+                    todoCompleted: 1,
+                    todoExpected: 1
+                ),
+                DailySummary(
+                    dateLocal: "2026-05-12",
+                    completedItems: 4,
+                    expectedItems: 5,
+                    completionRate: 0.8,
+                    habitCompleted: 2,
+                    habitExpected: 3,
+                    todoCompleted: 2,
+                    todoExpected: 2
+                ),
+            ]
+        )
+        let viewModel = AnalyticsViewModel(repository: repository)
+
+        await viewModel.loadPeriod(anchorDate: "2026-03-12", periodType: .yearly, weekStart: 0)
+
+        XCTAssertEqual(viewModel.chartSeries.labels, (1...12).map(OneDate.shortMonth(for:)))
+        XCTAssertEqual(viewModel.chartSeries.values.count, 12)
+        XCTAssertEqual(viewModel.chartSeries.values[0], 2.0 / 3.0, accuracy: 0.001)
+        XCTAssertEqual(viewModel.chartSeries.values[1], 0, accuracy: 0.001)
+        XCTAssertEqual(viewModel.chartSeries.values[4], 0.8, accuracy: 0.001)
+    }
+
+    func testRefreshTasksContextRefreshesSchedulesForTodayMutations() async throws {
+        let api = MockAPIClient()
+        let syncQueue = InMemorySyncQueue()
+        let applier = TrackingNotificationPreferenceApplier()
+        let container = OneAppContainer(
+            authRepository: DefaultAuthRepository(apiClient: api),
+            tasksRepository: DefaultTasksRepository(apiClient: api, syncQueue: syncQueue),
+            todayRepository: DefaultTodayRepository(apiClient: api, syncQueue: syncQueue),
+            analyticsRepository: DefaultAnalyticsRepository(apiClient: api),
+            reflectionsRepository: DefaultReflectionsRepository(apiClient: api),
+            profileRepository: DefaultProfileRepository(apiClient: api),
+            coachRepository: DefaultCoachRepository(apiClient: api),
+            notificationApplier: applier
+        )
+
+        await container.authViewModel.createLocalProfile(displayName: "Local User")
+        await container.profileViewModel.load()
+        let initialApplyCount = await applier.recordedApplyCount()
+        XCTAssertEqual(initialApplyCount, 0)
+
+        await container.refreshTasksContext(anchorDate: "2026-03-12")
+
+        let refreshedApplyCount = await applier.recordedApplyCount()
+        XCTAssertEqual(refreshedApplyCount, 1)
+    }
+
     func testNotesViewModelCreateNoteAddsEntryToSelectedDay() async throws {
         let repository = ReflectionsStubRepository(notes: [])
         let viewModel = NotesViewModel(repository: repository)
@@ -956,6 +1091,28 @@ private actor ReflectionsStubRepository: ReflectionsRepository {
 
     func delete(id: String) async throws {
         notes.removeAll { $0.id == id }
+    }
+}
+
+private actor TrackingNotificationPreferenceApplier: NotificationPreferenceApplier {
+    private var applyCount = 0
+
+    func apply(preferences: UserPreferences) async -> NotificationScheduleStatus {
+        applyCount += 1
+        return NotificationScheduleStatus(
+            permissionGranted: true,
+            scheduledCount: 2,
+            lastRefreshedAt: Date(),
+            lastError: nil
+        )
+    }
+
+    func status() async -> NotificationScheduleStatus? {
+        nil
+    }
+
+    func recordedApplyCount() async -> Int {
+        applyCount
     }
 }
 

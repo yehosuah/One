@@ -18,13 +18,20 @@ final class PendingMutationEntity {
     }
 }
 
-public actor SwiftDataSyncQueue: SyncQueue {
-    private let context: ModelContext
+public actor SwiftDataSyncQueue: SyncQueue, ModelActor {
+    nonisolated public let modelContainer: ModelContainer
+    nonisolated public let modelExecutor: any ModelExecutor
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
 
-    public init(context: ModelContext) {
-        self.context = context
+    private var context: ModelContext {
+        modelContext
+    }
+
+    public init(container: ModelContainer) {
+        let context = ModelContext(container)
+        self.modelContainer = container
+        self.modelExecutor = DefaultSerialModelExecutor(modelContext: context)
     }
 
     public func enqueue(_ mutation: PendingMutation) async {

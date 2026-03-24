@@ -435,8 +435,10 @@ public actor HTTPAPIClient: APIClient {
             notes: input.notes,
             recurrenceRule: input.recurrenceRule,
             endDate: input.endDate,
+            clearEndDate: input.clearEndDate,
             priorityWeight: input.priorityWeight,
             preferredTime: input.preferredTime,
+            clearPreferredTime: input.clearPreferredTime,
             isActive: input.isActive
         )
         let data = try await send(path: path, method: "PATCH", body: body, extraHeaders: headers)
@@ -460,6 +462,7 @@ public actor HTTPAPIClient: APIClient {
             title: input.title,
             notes: input.notes,
             dueAt: input.dueAt.map(Self.encodeDateTime),
+            clearDueAt: input.clearDueAt,
             priority: input.priority,
             isPinned: input.isPinned,
             status: input.status?.rawValue
@@ -604,7 +607,7 @@ public actor HTTPAPIClient: APIClient {
             id: wire.id,
             userId: wire.userId,
             name: wire.name,
-            icon: wire.icon,
+            icon: OneIconKey.normalizedTaskCategoryID(name: wire.name, storedIcon: wire.icon),
             color: wire.color,
             sortOrder: wire.sortOrder,
             isDefault: wire.isDefault,
@@ -819,11 +822,11 @@ public actor MockAPIClient: APIClient {
         self.habits = []
         self.todos = [:]
         self.categories = [
-            Category(id: "c1", userId: "u1", name: "Gym", icon: "🏋️", sortOrder: 0, isDefault: true),
-            Category(id: "c2", userId: "u1", name: "School", icon: "🎓", sortOrder: 1, isDefault: true),
-            Category(id: "c3", userId: "u1", name: "Personal Projects", icon: "💡", sortOrder: 2, isDefault: true),
-            Category(id: "c4", userId: "u1", name: "Wellbeing", icon: "🌿", sortOrder: 3, isDefault: true),
-            Category(id: "c5", userId: "u1", name: "Life Admin", icon: "🧾", sortOrder: 4, isDefault: true),
+            Category(id: "c1", userId: "u1", name: "Gym", icon: OneIconKey.categoryGym.rawValue, sortOrder: 0, isDefault: true),
+            Category(id: "c2", userId: "u1", name: "School", icon: OneIconKey.categorySchool.rawValue, sortOrder: 1, isDefault: true),
+            Category(id: "c3", userId: "u1", name: "Personal Projects", icon: OneIconKey.categoryProjects.rawValue, sortOrder: 2, isDefault: true),
+            Category(id: "c4", userId: "u1", name: "Wellbeing", icon: OneIconKey.categoryWellbeing.rawValue, sortOrder: 3, isDefault: true),
+            Category(id: "c5", userId: "u1", name: "Life Admin", icon: OneIconKey.categoryLifeAdmin.rawValue, sortOrder: 4, isDefault: true),
         ]
         self.coachCards = [
             CoachCard(
@@ -1175,8 +1178,14 @@ public actor MockAPIClient: APIClient {
         if let title = input.title { habit.title = title }
         if let notes = input.notes { habit.notes = notes }
         if let recurrenceRule = input.recurrenceRule { habit.recurrenceRule = recurrenceRule }
+        if input.clearEndDate {
+            habit.endDate = nil
+        }
         if let endDate = input.endDate { habit.endDate = endDate }
         if let priorityWeight = input.priorityWeight { habit.priorityWeight = priorityWeight }
+        if input.clearPreferredTime {
+            habit.preferredTime = nil
+        }
         if let preferredTime = input.preferredTime { habit.preferredTime = preferredTime }
         if let isActive = input.isActive { habit.isActive = isActive }
         habits[index] = habit
@@ -1184,15 +1193,41 @@ public actor MockAPIClient: APIClient {
     }
 
     public func patchTodo(id: String, input: TodoUpdateInput, clientUpdatedAt: Date?) async throws -> Todo {
-        var fields: [String: String] = [:]
-        if let title = input.title { fields["title"] = title }
-        if let notes = input.notes { fields["notes"] = notes }
-        if let categoryId = input.categoryId { fields["category_id"] = categoryId }
-        if let priority = input.priority { fields["priority"] = String(priority) }
-        if let isPinned = input.isPinned { fields["is_pinned"] = isPinned ? "true" : "false" }
-        if let dueAt = input.dueAt { fields["due_at"] = Self.encodeDateTime(dueAt) }
-        if let status = input.status { fields["status"] = status.rawValue }
-        return try await patchTodo(id: id, fields: fields, clientUpdatedAt: clientUpdatedAt)
+        var todo = todos[id] ?? Todo(id: id, userId: "u1", categoryId: "c1", title: "task")
+        if let clientUpdatedAt, clientUpdatedAt < todo.updatedAt {
+            return todo
+        }
+        if let categoryId = input.categoryId {
+            todo = Todo(
+                id: todo.id,
+                userId: todo.userId,
+                categoryId: categoryId,
+                title: todo.title,
+                notes: todo.notes,
+                dueAt: todo.dueAt,
+                priority: todo.priority,
+                isPinned: todo.isPinned,
+                status: todo.status,
+                completedAt: todo.completedAt,
+                createdAt: todo.createdAt,
+                updatedAt: todo.updatedAt
+            )
+        }
+        if let title = input.title { todo.title = title }
+        if let notes = input.notes { todo.notes = notes }
+        if let priority = input.priority { todo.priority = priority }
+        if let isPinned = input.isPinned { todo.isPinned = isPinned }
+        if input.clearDueAt {
+            todo.dueAt = nil
+        }
+        if let dueAt = input.dueAt { todo.dueAt = dueAt }
+        if let status = input.status {
+            todo.status = status
+            todo.completedAt = status == .completed ? Date() : nil
+        }
+        todo.updatedAt = Date()
+        todos[id] = todo
+        return todo
     }
 
     public func deleteHabit(id: String) async throws {
@@ -1365,14 +1400,16 @@ private struct WireTodoCreateRequest: Codable {
     }
 }
 
-private struct WireHabitUpdateRequest: Codable {
+private struct WireHabitUpdateRequest: Encodable {
     let categoryId: String?
     let title: String?
     let notes: String?
     let recurrenceRule: String?
     let endDate: String?
+    let clearEndDate: Bool
     let priorityWeight: Int?
     let preferredTime: String?
+    let clearPreferredTime: Bool
     let isActive: Bool?
 
     enum CodingKeys: String, CodingKey {
@@ -1385,13 +1422,34 @@ private struct WireHabitUpdateRequest: Codable {
         case preferredTime = "preferred_time"
         case isActive = "is_active"
     }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(categoryId, forKey: .categoryId)
+        try container.encodeIfPresent(title, forKey: .title)
+        try container.encodeIfPresent(notes, forKey: .notes)
+        try container.encodeIfPresent(recurrenceRule, forKey: .recurrenceRule)
+        if clearEndDate {
+            try container.encodeNil(forKey: .endDate)
+        } else {
+            try container.encodeIfPresent(endDate, forKey: .endDate)
+        }
+        try container.encodeIfPresent(priorityWeight, forKey: .priorityWeight)
+        if clearPreferredTime {
+            try container.encodeNil(forKey: .preferredTime)
+        } else {
+            try container.encodeIfPresent(preferredTime, forKey: .preferredTime)
+        }
+        try container.encodeIfPresent(isActive, forKey: .isActive)
+    }
 }
 
-private struct WireTodoUpdateRequest: Codable {
+private struct WireTodoUpdateRequest: Encodable {
     let categoryId: String?
     let title: String?
     let notes: String?
     let dueAt: String?
+    let clearDueAt: Bool
     let priority: Int?
     let isPinned: Bool?
     let status: String?
@@ -1404,6 +1462,21 @@ private struct WireTodoUpdateRequest: Codable {
         case priority
         case isPinned = "is_pinned"
         case status
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(categoryId, forKey: .categoryId)
+        try container.encodeIfPresent(title, forKey: .title)
+        try container.encodeIfPresent(notes, forKey: .notes)
+        if clearDueAt {
+            try container.encodeNil(forKey: .dueAt)
+        } else {
+            try container.encodeIfPresent(dueAt, forKey: .dueAt)
+        }
+        try container.encodeIfPresent(priority, forKey: .priority)
+        try container.encodeIfPresent(isPinned, forKey: .isPinned)
+        try container.encodeIfPresent(status, forKey: .status)
     }
 }
 

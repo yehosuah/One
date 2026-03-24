@@ -329,14 +329,15 @@ public enum LocalPersistenceFactory {
             configuration = ModelConfiguration("OneOfflineStore", url: storeURL)
         }
         let container = try ModelContainer(for: schema, configurations: [configuration])
-        let apiClient = LocalDataClient(context: ModelContext(container), sessionStore: sessionStore)
-        let syncQueue = SwiftDataSyncQueue(context: ModelContext(container))
+        let apiClient = LocalDataClient(container: container, sessionStore: sessionStore)
+        let syncQueue = SwiftDataSyncQueue(container: container)
         return LocalPersistenceStack(container: container, apiClient: apiClient, syncQueue: syncQueue)
     }
 }
 
-public actor LocalDataClient: LocalDataGateway, LocalProfileInspectable {
-    private let context: ModelContext
+public actor LocalDataClient: LocalDataGateway, LocalProfileInspectable, ModelActor {
+    nonisolated public let modelContainer: ModelContainer
+    nonisolated public let modelExecutor: any ModelExecutor
     private let sessionStore: AuthSessionStore
     private let onboardingService = LocalOnboardingService()
     private let todayService = LocalTodayService()
@@ -346,8 +347,14 @@ public actor LocalDataClient: LocalDataGateway, LocalProfileInspectable {
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
 
-    public init(context: ModelContext, sessionStore: AuthSessionStore) {
-        self.context = context
+    private var context: ModelContext {
+        modelContext
+    }
+
+    public init(container: ModelContainer, sessionStore: AuthSessionStore) {
+        let context = ModelContext(container)
+        self.modelContainer = container
+        self.modelExecutor = DefaultSerialModelExecutor(modelContext: context)
         self.sessionStore = sessionStore
     }
 
@@ -884,8 +891,10 @@ public actor LocalDataClient: LocalDataGateway, LocalProfileInspectable {
         if let title = input.title { entity.title = title }
         if let notes = input.notes { entity.notes = notes }
         if let recurrenceRule = input.recurrenceRule { entity.recurrenceRule = recurrenceRule }
+        if input.clearEndDate { entity.endDate = nil }
         if let endDate = input.endDate { entity.endDate = endDate }
         if let priorityWeight = input.priorityWeight { entity.priorityWeight = priorityWeight }
+        if input.clearPreferredTime { entity.preferredTime = nil }
         if let preferredTime = input.preferredTime { entity.preferredTime = preferredTime }
         if let isActive = input.isActive { entity.isActive = isActive }
         entity.updatedAt = Date()
@@ -916,6 +925,7 @@ public actor LocalDataClient: LocalDataGateway, LocalProfileInspectable {
         if let categoryId = input.categoryId { entity.categoryId = categoryId }
         if let title = input.title { entity.title = title }
         if let notes = input.notes { entity.notes = notes }
+        if input.clearDueAt { entity.dueAt = nil }
         if let dueAt = input.dueAt { entity.dueAt = dueAt }
         if let priority = input.priority { entity.priority = priority }
         if let isPinned = input.isPinned { entity.isPinned = isPinned }
@@ -1090,7 +1100,7 @@ public actor LocalDataClient: LocalDataGateway, LocalProfileInspectable {
             id: entity.id,
             userId: entity.userId,
             name: entity.name,
-            icon: entity.icon,
+            icon: OneIconKey.normalizedTaskCategoryID(name: entity.name, storedIcon: entity.icon),
             color: entity.color,
             sortOrder: entity.sortOrder,
             isDefault: entity.isDefault,

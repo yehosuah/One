@@ -335,6 +335,8 @@ public struct OneAppShell: View {
     @State private var activeSheet: SheetRoute?
     @State private var didBootstrap = false
     @State private var isBootstrapping = true
+    @State private var lastResolvedAnchorDate: String?
+    @Environment(\.scenePhase) private var scenePhase
 
     public init(container: OneAppContainer = OneAppContainer.live()) {
         _container = StateObject(wrappedValue: container)
@@ -460,6 +462,7 @@ public struct OneAppShell: View {
             }
             didBootstrap = true
             await container.bootstrap(anchorDate: currentAnchorDate)
+            lastResolvedAnchorDate = currentAnchorDate
             isBootstrapping = false
         }
         .onChange(of: container.authViewModel.user?.id) { _, newUserID in
@@ -470,10 +473,28 @@ public struct OneAppShell: View {
                 if newUserID != nil {
                     selectedTab = .today
                     await container.refreshAll(anchorDate: currentAnchorDate)
+                    lastResolvedAnchorDate = currentAnchorDate
                 } else {
                     selectedTab = .today
                     activeSheet = nil
+                    lastResolvedAnchorDate = nil
                 }
+            }
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            guard newPhase == .active,
+                  !isBootstrapping,
+                  didBootstrap,
+                  container.authViewModel.user != nil else {
+                return
+            }
+            let anchorDate = currentAnchorDate
+            guard anchorDate != lastResolvedAnchorDate else {
+                return
+            }
+            Task {
+                await container.refreshAll(anchorDate: anchorDate)
+                lastResolvedAnchorDate = anchorDate
             }
         }
     }
@@ -1033,14 +1054,14 @@ private struct LocalProfileSetupView: View {
         switch accessMode {
         case .local?:
             return localProfileCandidate == nil
-                ? "Start with a local profile and keep using One on this device."
+                ? "Start with a local profile and keep your data on this iPhone."
                 : "Your profile and data are still on this iPhone."
         case .signIn?:
             return "Use your account to sync your data across future devices."
         case .createAccount?:
             return "Create an account when you want more than local device storage."
         case nil:
-            return "Choose the simplest way to begin."
+            return "One currently runs as a local-first iPhone app."
         }
     }
 
@@ -1166,19 +1187,11 @@ private struct LocalProfileSetupView: View {
         }
 
         OneSurfaceCard(palette: palette) {
-            OneSectionHeading(palette: palette, title: "Use an account", meta: "Optional")
-            Text("Choose this when you want to sign in or create an account for future portability.")
+            OneSectionHeading(palette: palette, title: "Local storage", meta: "This pass")
+            Text("Your profile, reminders, and progress stay on this iPhone. Account sync is not available in the current local runtime.")
                 .font(OneType.secondary)
                 .foregroundStyle(palette.subtext)
                 .fixedSize(horizontal: false, vertical: true)
-            OneActionButton(palette: palette, title: "Sign In", style: .secondary) {
-                accessMode = .signIn
-            }
-            Button("Create Account") {
-                accessMode = .createAccount
-            }
-            .font(OneType.label)
-            .foregroundStyle(palette.accent)
         }
     }
 
@@ -2672,7 +2685,7 @@ private struct TodayTabView: View {
     private func toggleItem(_ item: TodayItem) {
         performItemAction(for: item) {
             await todayViewModel.toggle(item: item, dateLocal: dateLocal)
-            await onRefreshAnalytics()
+            await onRefreshTasksContext()
         }
     }
 
@@ -3848,6 +3861,7 @@ private struct HabitDetailView: View {
                                 recurrenceRule: recurrenceRule.rawValue,
                                 priorityWeight: selectedPriorityTier.representativeValue,
                                 preferredTime: usesPreferredTime ? OneTimeValueFormatter.string(from: preferredTimeSelection) : nil,
+                                clearPreferredTime: !usesPreferredTime,
                                 isActive: isActive
                             )
                         ) != nil else {
@@ -4002,6 +4016,7 @@ private struct TodoDetailView: View {
                                 title: title,
                                 notes: notes,
                                 dueAt: hasDueDate ? dueDate : nil,
+                                clearDueAt: !hasDueDate,
                                 priority: selectedPriorityTier.representativeValue,
                                 isPinned: selectedPriorityTier == .urgent,
                                 status: status
@@ -4113,18 +4128,22 @@ private struct NotificationPreferencesView: View {
                     } footer: {
                         Text(
                             status.permissionGranted
-                            ? "Reminders are being scheduled on this device."
+                            ? "Habit and task reminders are being scheduled on this device."
                             : "Reminder scheduling needs notification permission in iOS Settings."
                         )
                     }
                 }
 
-                Section("Reminder types") {
+                Section {
                     Toggle("Habit reminders", isOn: $habitReminders)
                     Toggle("Task reminders", isOn: $todoReminders)
                     Toggle("Notes prompts", isOn: $reflectionPrompts)
                     Toggle("Weekly summary", isOn: $weeklySummary)
                     Toggle("Coach prompts", isOn: $coachEnabled)
+                } header: {
+                    Text("Reminder types")
+                } footer: {
+                    Text("Only habit and task reminders are scheduled on this iPhone right now. Notes prompts, weekly summary, and coach prompts are saved as preferences for later support.")
                 }
 
                 Section {

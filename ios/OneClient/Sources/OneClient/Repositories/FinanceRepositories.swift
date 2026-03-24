@@ -135,26 +135,23 @@ private enum FinanceRepositoryError: LocalizedError {
     }
 }
 
-public actor LocalFinanceRepository: FinanceRepository {
-    private let container: ModelContainer
+public actor LocalFinanceRepository: FinanceRepository, ModelActor {
+    nonisolated public let modelContainer: ModelContainer
+    nonisolated public let modelExecutor: any ModelExecutor
     private let sessionStore: AuthSessionStore
     private let categoryService = LocalFinanceCategoryService()
     private let recurringService = LocalFinanceRecurringService()
     private let analyticsService = LocalFinanceAnalyticsService()
-    private var cachedContext: ModelContext?
 
     public init(container: ModelContainer, sessionStore: AuthSessionStore) {
-        self.container = container
+        let context = ModelContext(container)
+        self.modelContainer = container
+        self.modelExecutor = DefaultSerialModelExecutor(modelContext: context)
         self.sessionStore = sessionStore
     }
 
     private var context: ModelContext {
-        if let cachedContext {
-            return cachedContext
-        }
-        let context = ModelContext(container)
-        cachedContext = context
-        return context
+        modelContext
     }
 
     public func loadHome(weekStart: Int) async throws -> FinanceHomeSnapshot {
@@ -325,7 +322,10 @@ public actor LocalFinanceRepository: FinanceRepository {
         let category = FinanceCategory(
             id: UUID().uuidString,
             name: trimmedName.isEmpty ? "Custom" : trimmedName,
-            iconName: input.iconName.isEmpty ? "tag.fill" : input.iconName,
+            iconName: OneIconKey.normalizedFinanceCategoryID(
+                name: trimmedName.isEmpty ? "Custom" : trimmedName,
+                storedIcon: input.iconName.isEmpty ? OneIconKey.financeCategory.rawValue : input.iconName
+            ),
             isCustom: true,
             isArchived: false,
             sortOrder: sortOrder,
@@ -359,7 +359,7 @@ public actor LocalFinanceRepository: FinanceRepository {
             entity.name = name
         }
         if let iconName = input.iconName, !iconName.isEmpty {
-            entity.iconName = iconName
+            entity.iconName = OneIconKey.normalizedFinanceCategoryID(name: entity.name, storedIcon: iconName)
         }
         entity.updatedAt = Date()
         try save()
@@ -830,7 +830,7 @@ public actor LocalFinanceRepository: FinanceRepository {
         FinanceCategory(
             id: entity.id,
             name: entity.name,
-            iconName: entity.iconName,
+            iconName: OneIconKey.normalizedFinanceCategoryID(name: entity.name, storedIcon: entity.iconName),
             isCustom: entity.isCustom,
             isArchived: entity.isArchived,
             sortOrder: entity.sortOrder,
